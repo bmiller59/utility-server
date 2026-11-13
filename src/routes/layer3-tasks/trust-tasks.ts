@@ -16,7 +16,7 @@
  * ## The correctness rule
  *
  * A document carrying a `proof` whose issuer is NOT authenticated by this transport is
- * INDETERMINATE — we refuse it (401 `proof/unattributable`) rather than act as its
+ * INDETERMINATE — we refuse it (`identityMismatch`, 422) rather than act as its
  * content asks. This is the transport-edge realization of "indeterminate, not allow":
  * a proof proves *who asked*, never *that they may*, and without a transport binding we
  * cannot even attribute it. We do NOT verify the proof's cryptosuite here (crypto stays
@@ -32,6 +32,16 @@
  *   test     — payload `{ policy, query, data? }`                 → engine dry-run on supplied input
  *   validate — payload `{ policy }`                               → engine.validatePolicy
  *   upsert   — payload `{ policy }`                               → validate + persist + fan-out
+ *
+ * ## Errors
+ *
+ * Every refusal is a framework `trust-task-error` document (built by the core boundary's
+ * `buildErrorDocument`), threaded and addressed per the framework, with a status from the HTTPS
+ * binding's table (`httpStatusForCode`): 400 `malformedRequest`, 422 for `unsupportedType`,
+ * `wrongRecipient`, `identityMismatch` and the other refusals, 500 `internalError`. Messages come
+ * from a fixed vocabulary; nothing the requester sent is echoed. Anything thrown that is not a
+ * `TaskError` is the catch-all: an opaque `internalError`, logged here, never leaked. A document
+ * that is itself an error is never answered (204, no body).
  */
 
 import type { DataSource } from '@p2p-trust-stack/core/db/data-source.js';
@@ -47,28 +57,23 @@ import type { PolicyQuery } from '@p2p-trust-stack/core/services/policy-engine.j
 import {
   parseTrustTask,
   buildResponse,
-  buildError,
   isIndeterminateForProof,
   typeUriToOperation,
 } from '@p2p-trust-stack/core/services/trust-tasks/index.js';
 import type {
   TrustTaskDocument,
-  TrustTaskError,
   PolicyDocumentOperation,
 } from '@p2p-trust-stack/core/services/trust-tasks/index.js';
 import { gatePolicy } from '@p2p-trust-stack/core/services/policy-gate.js';
+import {
+  HTTP_STATUS_NO_CONTENT,
+  TaskError,
+  buildErrorDocument,
+  httpStatusForCode,
+  isInboundError,
+} from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
+import type { ErrorRequestRef } from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
 import { validateSession } from '../../session.js';
-
-/** An operational refusal that becomes a `buildError` response. */
-class TaskFailure extends Error {
-  readonly code: string;
-  readonly status: number;
-  constructor(code: string, message: string, status = 400) {
-    super(message);
-    this.code = code;
-    this.status = status;
-  }
-}
 
 function payloadOf(doc: TrustTaskDocument): Record<string, unknown> {
   return (typeof doc.payload === 'object' && doc.payload !== null
@@ -82,27 +87,25 @@ async function resolveCommunityByDid(
   did: string | undefined,
 ): Promise<{ uuid: string; did: string; role: string }> {
   if (!did || typeof did !== 'string' || did.length === 0) {
-    throw new TaskFailure('malformedRequest', 'recipient (community DID) is required', 400);
+    throw new TaskError({ code: 'malformedRequest', internalMessage: 'recipient (community DID) is required' });
   }
   const identity = await identitiesRepo.findByRealDid(db, did);
   if (!identity || !identity.did) {
-    throw new TaskFailure('communityNotFound', `community ${did} not found`, 404);
+    throw new TaskError({ code: 'wrongRecipient', internalMessage: `community ${did} not found` });
   }
   return { uuid: identity.uuid, did: identity.did, role: identity.role };
 }
 
-/** Is `issuer` the same identity the session authenticated? */
-async function issuerAuthenticated(
+/** The DID the session cookie authenticates, if any. The transport-authenticated sender. */
+async function sessionDid(
   db: DataSource,
-  doc: TrustTaskDocument,
   cookie: string | undefined,
   secret: Buffer,
-): Promise<boolean> {
-  if (!doc.issuer || typeof doc.issuer !== 'string') return false;
+): Promise<string | undefined> {
   const session = validateSession(cookie, secret);
-  if (!session) return false;
+  if (!session) return undefined;
   const identity = await identitiesRepo.findByUuid(db, session.identityUuid);
-  return identity?.did === doc.issuer;
+  return identity?.did ?? undefined;
 }
 
 async function evaluateTask(db: DataSource, doc: TrustTaskDocument): Promise<unknown> {
@@ -110,10 +113,10 @@ async function evaluateTask(db: DataSource, doc: TrustTaskDocument): Promise<unk
   const p = payloadOf(doc);
   const action = p.action;
   if (typeof action !== 'string' || !action) {
-    throw new TaskFailure('policy/invalid', 'payload.action is required', 400);
+    throw new TaskError({ code: 'malformedRequest', internalMessage: 'payload.action is required' });
   }
   if (!(POLICY_ACTIONS as readonly string[]).includes(action)) {
-    throw new TaskFailure('policy/invalid', `unknown action '${action}'`, 400);
+    throw new TaskError({ code: 'malformedRequest', internalMessage: `unknown action '${action}'` });
   }
   const params: Record<string, unknown> = {};
   if (p.kind !== undefined) params.kind = p.kind;
@@ -139,16 +142,28 @@ async function evaluateTask(db: DataSource, doc: TrustTaskDocument): Promise<unk
  */
 async function dispatch(db: DataSource, op: PolicyDocumentOperation, doc: TrustTaskDocument): Promise<unknown> {
   if (op === 'evaluate') return evaluateTask(db, doc);
-  throw new TaskFailure('endpointNotFound', `unsupported operation '${op}'`, 404);
+  throw new TaskError({ code: 'unsupportedType', internalMessage: `unsupported operation '${op}'` });
 }
 
+/**
+ * Reply with a framework error document and the binding's status for its code. `recipient` is the
+ * transport-authenticated sender when the in-band identity is contested; otherwise the in-band issuer.
+ */
 function sendError(
   reply: FastifyReply,
-  doc: TrustTaskDocument | undefined,
-  status: number,
-  error: TrustTaskError,
+  request: ErrorRequestRef | undefined,
+  error: unknown,
+  recipient?: string,
 ) {
-  return reply.code(status).send(buildError(doc, error));
+  const doc = buildErrorDocument(request, error, recipient === undefined ? {} : { recipient });
+  return reply.code(httpStatusForCode(doc.payload.code)).send(doc);
+}
+
+/** What an unparseable body still tells us safely: identifiers only, never addressing. */
+function partialRef(body: unknown): ErrorRequestRef | undefined {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined;
+  const b = body as Record<string, unknown>;
+  return { id: b.id, type: b.type, threadId: b.threadId };
 }
 
 export function registerTrustTaskRoutes(app: FastifyInstance, db: DataSource): void {
@@ -158,44 +173,45 @@ export function registerTrustTaskRoutes(app: FastifyInstance, db: DataSource): v
       // 1. Parse the envelope.
       const parsed = parseTrustTask(req.body);
       if (!parsed.ok) {
-        return sendError(reply, undefined, 400, { code: parsed.code, message: parsed.message });
+        return sendError(reply, partialRef(req.body), new TaskError({ code: 'malformedRequest', internalMessage: parsed.message }));
       }
       const doc = parsed.document;
 
-      // 2. A response document is not a request.
+      // 2. An error document is never answered (no error loops) and changes nothing.
+      if (isInboundError(doc)) {
+        return reply.code(HTTP_STATUS_NO_CONTENT).send();
+      }
+
+      // 3. A response document is not a request.
       if (doc.type.endsWith('#response')) {
-        return sendError(reply, doc, 400, { code: 'malformedRequest', message: 'a #response document is not a request' });
+        return sendError(reply, doc, new TaskError({ code: 'malformedRequest', internalMessage: 'a #response document is not a request' }));
       }
 
-      // 3. Transport attribution of the issuer.
+      // 4. Transport attribution of the issuer.
       const hmacSecret = (app as unknown as { hmacSecret?: Buffer }).hmacSecret;
-      const authenticated = hmacSecret
-        ? await issuerAuthenticated(db, doc, req.headers.cookie, hmacSecret)
-        : false;
+      const senderDid = hmacSecret ? await sessionDid(db, req.headers.cookie, hmacSecret) : undefined;
+      const authenticated = senderDid !== undefined && senderDid === doc.issuer;
 
-      // 4. proof → indeterminate (never silently allow).
+      // 5. proof → indeterminate (never silently allow). The error goes to the authenticated sender
+      //    when there is one (framework 8.1), never to the contested in-band issuer.
       if (isIndeterminateForProof(doc, authenticated)) {
-        return sendError(reply, doc, 401, {
-          code: 'proof/unattributable',
-          message: 'document carries a proof, but its issuer is not authenticated over this transport',
-        });
+        return sendError(reply, doc, new TaskError({ code: 'identityMismatch' }), senderDid);
       }
 
-      // 5. Route by type.
+      // 6. Route by type.
       const op = typeUriToOperation(doc.type);
       if (!op) {
-        return sendError(reply, doc, 404, { code: 'endpointNotFound', message: `unknown task type '${doc.type}'` });
+        return sendError(reply, doc, new TaskError({ code: 'unsupportedType' }));
       }
 
-      // 6. Dispatch, and wrap the reply.
+      // 7. Dispatch, and wrap the reply. Whatever is thrown is mapped; only a `TaskError` has a
+      //    defined wire form, anything else is logged and answered as an opaque internalError.
       try {
         const result = await dispatch(db, op, doc);
         return reply.send(buildResponse(doc, result));
       } catch (err) {
-        if (err instanceof TaskFailure) {
-          return sendError(reply, doc, err.status, { code: err.code, message: err.message });
-        }
-        throw err;
+        if (!(err instanceof TaskError)) req.log.error({ err }, 'trust-tasks: unexpected failure');
+        return sendError(reply, doc, err);
       }
     },
   );
