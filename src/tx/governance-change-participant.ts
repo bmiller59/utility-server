@@ -37,7 +37,7 @@ import { generateUuid } from '@p2p-trust-stack/core/db/uuid-helpers.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
 import { createPolicyEngine } from '@p2p-trust-stack/core/services/policy-engine-config.js';
 import { guardAuthorizer } from '@p2p-trust-stack/core/services/trust-tasks/authorizer.js';
-import { driveCeremony } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
+import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
 import { registerExecutor } from '@p2p-trust-stack/core/services/trust-tasks/catalog.js';
 import { GOVERNANCE_CHANGE_APPLY_TYPE, CEREMONY_GOVERNANCE_CHANGE } from '@p2p-trust-stack/core/services/trust-tasks/type-uris.js';
 import { tryEnqueueFanout } from '../services/exchange-runtime.js';
@@ -418,7 +418,7 @@ export class GovernanceChangeParticipant implements Participant {
     }
 
     const communityUuid = proposal.communityUuid;
-    await this.appDb.transaction(async (tx) => {
+    await driveAtomically(this.appDb, proposalId, async (tx) => {
       const drive = await driveCeremony(tx, CEREMONY_GOVERNANCE_CHANGE, proposalId, {
         authorizer: guardAuthorizer(new GovernanceGuard(tx, createPolicyEngine())),
         context: {

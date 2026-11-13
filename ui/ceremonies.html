@@ -154,7 +154,11 @@
       ? fillWords(wording[step.direction], facts)
       : (step.direction === 'request' ? 'Requested: ' : 'Completed: ') + humanType(step.type).toLowerCase() + '.';
     // A refusal is the interesting case — never hide why.
-    if (step.status === 'denied') sentence += facts.reason ? ' Refused: ' + facts.reason : ' Refused.';
+    // The reason is stored as `reason` (co-sign refusals, policy gates, failed steps), with the
+  // standard vocabulary's `explanation` or a failed step's `error` as fallbacks.
+  var why = facts.reason || facts.explanation || facts.error;
+  if (step.status === 'denied') sentence += why ? ' Refused: ' + why : ' Refused.';
+  else if (step.status === 'failed') sentence += why ? ' Failed: ' + why : ' Failed.';
     return { label: label, sentence: sentence };
   }
 

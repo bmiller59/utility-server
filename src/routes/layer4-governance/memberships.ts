@@ -30,7 +30,7 @@ import { gateMembershipAdmission } from '@p2p-trust-stack/core/services/membersh
 import type { MembershipPresentation } from '@p2p-trust-stack/core/services/membership-presentation.js';
 import { tryEnqueueFanout } from '../../services/exchange-runtime.js';
 import { randomUUID } from 'node:crypto';
-import { driveCeremony } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
+import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
 import { guardAuthorizer } from '@p2p-trust-stack/core/services/trust-tasks/authorizer.js';
 import { CEREMONY_MEMBER_ONBOARDING, ONBOARDING_VMC_TYPE } from '@p2p-trust-stack/core/services/trust-tasks/type-uris.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
@@ -221,7 +221,7 @@ export function registerMembershipRoutes(app: FastifyInstance, db: DataSource): 
       const threadId = randomUUID();
       let credentialUuid: string | undefined;
       try {
-        const driven = await db.transaction((tx) =>
+        const driven = await driveAtomically(db, threadId, (tx) =>
           driveCeremony(tx, CEREMONY_MEMBER_ONBOARDING, threadId, {
             authorizer: guardAuthorizer(new GovernanceGuard(tx, createPolicyEngine())),
             context: {

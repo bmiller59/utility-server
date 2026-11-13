@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 
 import { SqliteDataSource } from '@p2p-trust-stack/core/db/sqlite-data-source.js';
 import { runMigrations } from '@p2p-trust-stack/core/db/migrate.js';
-import { TX_SCHEMA_SQL } from '@p2p-trust-stack/core/tx/schema.js';
+import { TX_SCHEMA_SQL, TX_ADDITIVE_COLUMNS } from '@p2p-trust-stack/core/tx/schema.js';
 import { CeremonyStore } from '@p2p-trust-stack/core/tx/ceremony-store.js';
 import { CeremonyCoordinatorParticipant } from '../../src/tx/ceremony-participant.js';
 import * as identitiesRepo from '@p2p-trust-stack/core/db/repositories/identities-repo.js';
@@ -44,6 +44,10 @@ function makeAppDb(): SqliteDataSource {
 function makeTxDb(): SqliteDataSource {
   const ds = new SqliteDataSource(':memory:');
   ds.getRawDb().exec(TX_SCHEMA_SQL);
+  // What the server does at boot: the additive columns (error_code, retryable) failures are recorded in.
+  for (const col of TX_ADDITIVE_COLUMNS) {
+    try { ds.getRawDb().exec(col.ddl); } catch { /* already in the base schema */ }
+  }
   return ds;
 }
 
