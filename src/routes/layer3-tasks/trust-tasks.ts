@@ -68,6 +68,7 @@ import {
 import { AcceptedIdStore } from '@p2p-trust-stack/core/services/trust-tasks/boundary/accepted-store.js';
 import type { PipelineHandler } from '@p2p-trust-stack/core/services/trust-tasks/boundary/handlers.js';
 import type { ReplayGuard } from '@p2p-trust-stack/core/services/trust-tasks/boundary/runtime.js';
+import { TrustTaskRecorder } from '@p2p-trust-stack/core/services/trust-tasks/boundary/recorder.js';
 import { DidResolutionService } from '@p2p-trust-stack/core/did/did-resolution-service.js';
 import { DidProofVerifier } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/verify.js';
 import { createServerKeyResolver } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
@@ -94,6 +95,11 @@ export interface TrustTaskRouteOptions {
   tier?: 1 | 2;
   /** Replies are signed with this identity; default the process's installed boundary signer. */
   signer?: BoundarySigner | (() => BoundarySigner | undefined);
+  /**
+   * Persist what the boundary processes (decision A4): verbatim raw document, proof, digests and
+   * verified signer in `trust_tasks`, never a body refused before proof verification. Default true.
+   */
+  recordDocuments?: boolean;
   /** The proof verifier; default one resolving did:key, did:peer:4 and did:scid:vh (log only, never a cached snapshot). */
   verifier?: DidProofVerifier;
   /** Default `/trust-tasks`; deployments differ on paths (HTTPS binding). */
@@ -149,6 +155,7 @@ export function registerTrustTaskRoutes(
 ): void {
   const strictness = options.strictness ?? strictnessFromEnv(process.env.TRUST_TASKS_STRICTNESS);
   const acceptedStore = new AcceptedIdStore(db, options.now === undefined ? {} : { now: options.now });
+  const recorder = options.recordDocuments === false ? undefined : new TrustTaskRecorder(db, { node: 'utility-server', onError: (err) => app.log.error({ err }, 'trust-tasks: recording a document failed') });
   const pipeline = new Pipeline({
     handlers: [createLegacyEvaluateHandler(db), ...(options.extraHandlers ?? [])],
     guard: options.guard ?? acceptedStore,
@@ -159,6 +166,7 @@ export function registerTrustTaskRoutes(
       tier: options.tier ?? tierFromEnv(process.env.TRUST_TASKS_TIER),
     },
     signer: options.signer ?? getBoundarySigner,
+    ...(recorder === undefined ? {} : { record: (result: PipelineResult) => recorder.record(result) }),
     ...(options.now === undefined ? {} : { now: options.now }),
     strictness,
     onUnexpected: (err) => app.log.error({ err }, 'trust-tasks: unexpected failure'),

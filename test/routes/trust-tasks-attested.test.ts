@@ -158,3 +158,22 @@ test('the default answering identifier is the server DID recorded at startup (no
   assert.equal(code(res), 'wrongRecipient');
   assert.equal(res.json().issuer, 'did:scid:vh:recorded-server');
 });
+
+test('A4 persistence: an accepted signed request is stored verbatim with its proof and verified signer; a refused-before-proof body is not stored', async () => {
+  const { app, ds } = await seed({ signer: serverSigner, tier: 1 });
+  const { findByUuid } = await import('@p2p-trust-stack/core/db/repositories/trust-tasks-repo.js');
+  const good = sign(base({ id: 'urn:uuid:11111111-1111-4111-8111-111111111111' }));
+  const raw = JSON.stringify(good, null, 1);
+  const ok = await app.inject({ method: 'POST', url: '/trust-tasks', headers: { 'content-type': 'application/json' }, payload: raw });
+  assert.equal(ok.statusCode, 200);
+  const row = await findByUuid(ds, good.id as string);
+  assert.equal(row?.rawDocument, raw, 'verbatim bytes');
+  assert.equal(row?.verifiedSigner, PEER.did);
+  assert.ok(row?.proof && row.taskDigest?.startsWith('z'));
+  const reply = await findByUuid(ds, ok.json().id);
+  assert.equal(reply?.inReplyTo, good.id);
+  const badId = 'urn:uuid:22222222-2222-4222-8222-222222222222';
+  const bad = { ...sign(base({ id: badId })), payload: { forged: true } };
+  assert.equal(code(await post(app, bad)), 'proofInvalid');
+  assert.equal(await findByUuid(ds, badId), null, 'a body refused before proof verification is never stored');
+});
