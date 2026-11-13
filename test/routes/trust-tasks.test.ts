@@ -461,3 +461,40 @@ test('every status the route can produce is in the HTTPS binding table, and none
   for (const st of seen) assert.ok([400, 403, 409, 422, 500, 503].includes(st), String(st));
   assert.ok(!seen.has(401) && !seen.has(404));
 });
+
+// ── layer 3b: discovery (conformance P4b) ───────────────────────────────────
+
+const DISCOVERY = 'https://trusttasks.org/spec/trust-task-discovery/0.4';
+const EVALUATE_WIRE = 'urn:p2pts:tasks:spec:policy:evaluate:0.1';
+
+test('P4b discovery: the route lists exactly the registered types, with the pinned acceptance window', async () => {
+  const { app } = await seed();
+  const res = await post(app, env(DISCOVERY, { id: 'doc-disc-1', payload: {} }));
+  assert.equal(res.statusCode, 200, res.body);
+  const doc = res.json();
+  assert.equal(doc.type, `${DISCOVERY}#response`);
+  assert.equal(doc.threadId, 'thread-1');
+  assert.equal(doc.issuer, CLUB_DID);
+  assert.equal(doc.recipient, ADMIN_DID);
+  assert.deepEqual(doc.payload.supportedTypes, [DISCOVERY, EVALUATE_WIRE].sort());
+  assert.deepEqual(doc.payload.acceptanceWindow, { maxAgeSeconds: 300, clockSkewSeconds: 60, expiryHorizonSeconds: 30 * 24 * 3600 });
+  assert.equal(doc.payload.frameworkVersion, '0.6.0');
+});
+
+test('P4b discovery: patterns filter by slug and task control is never advertised or served', async () => {
+  const { app } = await seed();
+  const some = await post(app, env(DISCOVERY, { id: 'doc-disc-2', payload: { patterns: ['policy/*'] } }));
+  assert.deepEqual(some.json().payload.supportedTypes, [EVALUATE_WIRE]);
+  const none = await post(app, env(DISCOVERY, { id: 'doc-disc-3', payload: { patterns: ['trust-task-control'] } }));
+  assert.deepEqual(none.json().payload.supportedTypes, []);
+  const ctl = await post(app, env('https://trusttasks.org/spec/trust-task-control/0.1', { id: 'doc-disc-4' }));
+  assert.equal(ctl.statusCode, 422);
+  assert.equal(ctl.json().payload.code, 'unsupportedType');
+});
+
+test('P4b discovery: a recipient that is not a hosted community is wrongRecipient', async () => {
+  const { app } = await seed();
+  const res = await post(app, env(DISCOVERY, { id: 'doc-disc-5', recipient: 'did:scid:vh:nobody' }));
+  assert.equal(res.statusCode, 422);
+  assert.equal(res.json().payload.code, 'wrongRecipient');
+});
