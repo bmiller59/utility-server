@@ -166,8 +166,8 @@ test('design TIME: the strictness flag. strict by default; lenient lets a stale 
   const lenient = await seed({ strictness: 'lenient' });
   assert.equal((await post(lenient.app, doc(stale))).statusCode, 200);
   const withProof = await post(lenient.app, doc({ proof: { type: 'DataIntegrityProof' }, id: 'urn:uuid:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee' }));
-  assert.equal(withProof.statusCode, 400);
-  assert.equal(code(withProof), 'malformedRequest');
+  assert.equal(withProof.statusCode, 422);
+  assert.equal(code(withProof), 'proofInvalid');
   const unknownCommunity = await post(lenient.app, doc({ recipient: 'did:scid:vh:none', id: 'urn:uuid:ffffffff-ffff-4fff-8fff-ffffffffffff' }));
   assert.equal(code(unknownCommunity), 'wrongRecipient', 'the handler still resolves the community');
 });
