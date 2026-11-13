@@ -75,7 +75,7 @@ const ROUTE_DESCRIPTIONS: Record<string, string> = {
   'POST /nonces/:nonce/verify': 'Verify (and consume) a nonce.',
   'POST /auth/challenge': 'Issue a random nonce challenge for a VTA to sign (challenge-response authentication).',
   'POST /auth/verify': 'Verify an Ed25519 signature over a previously-issued nonce against the VTA\'s published key.',
-  'POST /trust-tasks': 'Submit a Trust Task envelope ({ id, type, threadId, issuer, recipient, issuedAt, payload, proof }); the task:p2pts:… type routes to evaluate/test/validate/upsert, and the reply is a #response envelope.',
+  'POST /trust-tasks': 'Submit a Trust Task envelope ({ id, type, threadId, issuer, recipient, issuedAt, payload, proof }); the task:p2pts:… type routes to the policy evaluate operation, and the reply is a #response envelope. A refusal is a trust-task-error document (payload {code, retryable, message, inResponseTo}): 400 malformedRequest, 422 for unsupportedType, wrongRecipient, identityMismatch and other refusals, 500 internalError; an error document sent here is not answered (204).',
 
   // Layer 4 — Governance
   'GET /memberships/:id': 'Fetch a single membership by numeric id.',
