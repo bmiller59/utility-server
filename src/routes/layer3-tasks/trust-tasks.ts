@@ -4,44 +4,41 @@
 /**
  * Layer 3 — Trust Tasks: `POST /trust-tasks` (the document-level bridge, P5.5).
  *
- * This is the ONE endpoint that speaks the Trust Task envelope: an inbound document
- * carrying `{id, type, threadId, issuer, recipient, issuedAt, payload, proof}` is parsed,
- * its `proof` checked for transport attribution, its `type` routed to a policy
- * operation, and the reply wrapped back into an envelope.
+ * This is the ONE endpoint that speaks the Trust Task envelope. Since conformance phase P2 it is a
+ * thin carrier over the core boundary pipeline (`boundary/pipeline.ts`): the route captures the raw
+ * body, establishes the transport-authenticated sender (the session cookie, or none) and hands both
+ * to the pipeline, which does everything else (envelope and type validation, payload check,
+ * freshness, recipient, sender cross-check, the interim proof policy, dispatch to the handler
+ * registry, typed errors) and says what to send back. The route maps that onto HTTP.
  *
- * It REUSES the P4 policy logic (`gatePolicy`, `createPolicyEngine`'s validate/evaluate,
- * the governance repo) rather than reimplementing it — the bridge only adds framing.
- * Our `type` identifiers are `task:p2pts:…` (see `src/services/trust-tasks/type-uris.ts`).
+ * ## Served types
  *
- * ## The correctness rule
+ * One handler: the legacy `policy/evaluate` task (core `boundary/legacy-evaluate.ts`), under its
+ * internal name `task:p2pts:policy:evaluate:0.1` and its wire form
+ * `urn:p2pts:tasks:spec:policy:evaluate:0.1`. Anything else is `unsupportedType`/`unsupportedVersion`.
  *
- * A document carrying a `proof` whose issuer is NOT authenticated by this transport is
- * INDETERMINATE — we refuse it (`identityMismatch`, 422) rather than act as its
- * content asks. This is the transport-edge realization of "indeterminate, not allow":
- * a proof proves *who asked*, never *that they may*, and without a transport binding we
- * cannot even attribute it. We do NOT verify the proof's cryptosuite here (crypto stays
- * in `GovernanceGuard`) — we only require that the `issuer` matches the session's
- * authenticated identity.
+ * ## Sender and proof
  *
- * ## Envelope → operation mapping
+ * The authenticated sender is the session cookie's identity. A document whose in-band `issuer`
+ * differs from it is `identityMismatch`, addressed to the authenticated sender (framework 8.1).
+ * Proof checks are never off: until the DID-resolving verifier lands a document carrying a `proof`
+ * is refused (`malformedRequest`, interim policy `rejectIfPresent`), cookie or not. A caller with
+ * no cookie is unauthenticated and is not refused for that (authorisation of evaluate by the
+ * verified sender is a later phase).
  *
- * The `recipient` is the community DID (`task:p2pts:policy:*` always names a community to
- * act on); the `issuer` is the actor DID; the `payload` carries the operation body:
+ * ## Strictness (one release)
  *
- *   evaluate — payload `{ action, kind?, subjectDid?, facts? }`  → `gatePolicy` (real facts)
- *   test     — payload `{ policy, query, data? }`                 → engine dry-run on supplied input
- *   validate — payload `{ policy }`                               → engine.validatePolicy
- *   upsert   — payload `{ policy }`                               → validate + persist + fan-out
+ * `TRUST_TASKS_STRICTNESS=lenient` (default `strict`; any other value is `strict`) lets the legacy
+ * evaluate task through with a stale or future `issuedAt` and an unserved `recipient` (the handler
+ * still resolves the community), logging each. It never relaxes the proof policy.
  *
- * ## Errors
+ * ## Body and statuses
  *
- * Every refusal is a framework `trust-task-error` document (built by the core boundary's
- * `buildErrorDocument`), threaded and addressed per the framework, with a status from the HTTPS
- * binding's table (`httpStatusForCode`): 400 `malformedRequest`, 422 for `unsupportedType`,
- * `wrongRecipient`, `identityMismatch` and the other refusals, 500 `internalError`. Messages come
- * from a fixed vocabulary; nothing the requester sent is echoed. Anything thrown that is not a
- * `TaskError` is the catch-all: an opaque `internalError`, logged here, never leaked. A document
- * that is itself an error is never answered (204, no body).
+ * The body is read raw (the pipeline parses it, and the bytes are retained on its result for the
+ * persistence phase). Statuses are the HTTPS binding's: 200 response, 204 absorbed (an inbound
+ * error is never answered), 202 in flight, the code-to-status table for errors; an unparseable or
+ * oversize body gets a minimal unsigned 400/413 body (415 for a content type other than JSON) that is not a Trust Task document. The path is
+ * `/trust-tasks` unless the deployment passes another.
  */
 
 import type { DataSource } from '@p2p-trust-stack/core/db/data-source.js';
@@ -52,48 +49,35 @@ import {
   listCeremonyThreads,
   getCeremonyThread,
 } from '@p2p-trust-stack/core/services/trust-tasks/ceremony-log.js';
-import { POLICY_ACTIONS } from '@p2p-trust-stack/core/services/policy-engine.js';
-import type { PolicyQuery } from '@p2p-trust-stack/core/services/policy-engine.js';
 import {
-  parseTrustTask,
-  buildResponse,
-  isIndeterminateForProof,
-  typeUriToOperation,
-} from '@p2p-trust-stack/core/services/trust-tasks/index.js';
+  DEFAULT_MAX_BODY_BYTES,
+  Pipeline,
+} from '@p2p-trust-stack/core/services/trust-tasks/boundary/pipeline.js';
 import type {
-  TrustTaskDocument,
-  PolicyDocumentOperation,
-} from '@p2p-trust-stack/core/services/trust-tasks/index.js';
-import { gatePolicy } from '@p2p-trust-stack/core/services/policy-gate.js';
+  PipelineResult,
+  Strictness,
+} from '@p2p-trust-stack/core/services/trust-tasks/boundary/pipeline.js';
 import {
-  HTTP_STATUS_NO_CONTENT,
-  TaskError,
-  buildErrorDocument,
-  httpStatusForCode,
-  isInboundError,
-} from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
-import type { ErrorRequestRef } from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
+  createLegacyEvaluateHandler,
+  isHostedCommunity,
+} from '@p2p-trust-stack/core/services/trust-tasks/boundary/legacy-evaluate.js';
 import { validateSession } from '../../session.js';
 
-function payloadOf(doc: TrustTaskDocument): Record<string, unknown> {
-  return (typeof doc.payload === 'object' && doc.payload !== null
-    ? doc.payload
-    : {}) as Record<string, unknown>;
+export interface TrustTaskRouteOptions {
+  /** Default: `TRUST_TASKS_STRICTNESS` (`lenient` or `strict`), else `strict`. */
+  strictness?: Strictness;
+  /** The identifier errors are issued by when the document names no hosted community. */
+  defaultVid?: string;
+  /** Default `/trust-tasks`; deployments differ on paths (HTTPS binding). */
+  path?: string;
+  /** Test hook: the clock, epoch milliseconds. */
+  now?: () => number;
+  /** Test hook: sees every pipeline result (raw bytes included) before the reply is sent. */
+  observe?: (result: PipelineResult) => void;
 }
 
-/** Resolve the community named by the envelope's `recipient` DID. */
-async function resolveCommunityByDid(
-  db: DataSource,
-  did: string | undefined,
-): Promise<{ uuid: string; did: string; role: string }> {
-  if (!did || typeof did !== 'string' || did.length === 0) {
-    throw new TaskError({ code: 'malformedRequest', internalMessage: 'recipient (community DID) is required' });
-  }
-  const identity = await identitiesRepo.findByRealDid(db, did);
-  if (!identity || !identity.did) {
-    throw new TaskError({ code: 'wrongRecipient', internalMessage: `community ${did} not found` });
-  }
-  return { uuid: identity.uuid, did: identity.did, role: identity.role };
+export function strictnessFromEnv(value: string | undefined): Strictness {
+  return value === 'lenient' ? 'lenient' : 'strict';
 }
 
 /** The DID the session cookie authenticates, if any. The transport-authenticated sender. */
@@ -108,113 +92,59 @@ async function sessionDid(
   return identity?.did ?? undefined;
 }
 
-async function evaluateTask(db: DataSource, doc: TrustTaskDocument): Promise<unknown> {
-  const community = await resolveCommunityByDid(db, doc.recipient);
-  const p = payloadOf(doc);
-  const action = p.action;
-  if (typeof action !== 'string' || !action) {
-    throw new TaskError({ code: 'malformedRequest', internalMessage: 'payload.action is required' });
-  }
-  if (!(POLICY_ACTIONS as readonly string[]).includes(action)) {
-    throw new TaskError({ code: 'malformedRequest', internalMessage: `unknown action '${action}'` });
-  }
-  const params: Record<string, unknown> = {};
-  if (p.kind !== undefined) params.kind = p.kind;
-  if (p.subjectDid !== undefined) params.subjectDid = p.subjectDid;
-  const query: PolicyQuery = {
-    action: action as PolicyQuery['action'],
-    communityDid: community.did,
-    actorDid: typeof doc.issuer === 'string' && doc.issuer ? doc.issuer : community.did,
-    params,
-  };
-  const facts = (p.facts && typeof p.facts === 'object')
-    ? p.facts as Record<string, unknown>
-    : undefined;
-  const result = await gatePolicy(db, query, facts);
-  return { communityUuid: community.uuid, communityDid: community.did, query, result };
+function reply(res: FastifyReply, result: PipelineResult) {
+  res.code(result.status);
+  if (result.status === 204 || result.status === 202) return res.send();
+  const body = result.document !== undefined ? result.document : result.minimal;
+  // The exact text sent is the document as built: a signed reply (P4) is signed over these bytes.
+  return res.header('content-type', 'application/json; charset=utf-8').send(JSON.stringify(body));
 }
 
-/**
- * Dispatch a policy trust-task operation. Only the read-only `evaluate` remains — the
- * document-writing ops (`upsert`/`test`/`validate`) were the utility server's developer
- * policy API and are removed. Governance changes flow through the governance-change
- * ceremony (Phase B), never a direct document write.
- */
-async function dispatch(db: DataSource, op: PolicyDocumentOperation, doc: TrustTaskDocument): Promise<unknown> {
-  if (op === 'evaluate') return evaluateTask(db, doc);
-  throw new TaskError({ code: 'unsupportedType', internalMessage: `unsupported operation '${op}'` });
-}
+export function registerTrustTaskRoutes(
+  app: FastifyInstance,
+  db: DataSource,
+  options: TrustTaskRouteOptions = {},
+): void {
+  const strictness = options.strictness ?? strictnessFromEnv(process.env.TRUST_TASKS_STRICTNESS);
+  const pipeline = new Pipeline({
+    handlers: [createLegacyEvaluateHandler(db)],
+    isServed: (recipient) => isHostedCommunity(db, recipient),
+    ...(options.defaultVid === undefined ? {} : { defaultVid: options.defaultVid }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+    strictness,
+    onUnexpected: (err) => app.log.error({ err }, 'trust-tasks: unexpected failure'),
+    onLenient: (event) => app.log.warn({ event }, 'trust-tasks: lenient strictness let a document through'),
+    maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+  });
 
-/**
- * Reply with a framework error document and the binding's status for its code. `recipient` is the
- * transport-authenticated sender when the in-band identity is contested; otherwise the in-band issuer.
- */
-function sendError(
-  reply: FastifyReply,
-  request: ErrorRequestRef | undefined,
-  error: unknown,
-  recipient?: string,
-) {
-  const doc = buildErrorDocument(request, error, recipient === undefined ? {} : { recipient });
-  return reply.code(httpStatusForCode(doc.payload.code)).send(doc);
-}
-
-/** What an unparseable body still tells us safely: identifiers only, never addressing. */
-function partialRef(body: unknown): ErrorRequestRef | undefined {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined;
-  const b = body as Record<string, unknown>;
-  return { id: b.id, type: b.type, threadId: b.threadId };
-}
-
-export function registerTrustTaskRoutes(app: FastifyInstance, db: DataSource): void {
-  app.post(
-    '/trust-tasks',
-    async (req: FastifyRequest<{ Body: unknown }>, reply: FastifyReply) => {
-      // 1. Parse the envelope.
-      const parsed = parseTrustTask(req.body);
-      if (!parsed.ok) {
-        return sendError(reply, partialRef(req.body), new TaskError({ code: 'malformedRequest', internalMessage: parsed.message }));
-      }
-      const doc = parsed.document;
-
-      // 2. An error document is never answered (no error loops) and changes nothing.
-      if (isInboundError(doc)) {
-        return reply.code(HTTP_STATUS_NO_CONTENT).send();
-      }
-
-      // 3. A response document is not a request.
-      if (doc.type.endsWith('#response')) {
-        return sendError(reply, doc, new TaskError({ code: 'malformedRequest', internalMessage: 'a #response document is not a request' }));
-      }
-
-      // 4. Transport attribution of the issuer.
-      const hmacSecret = (app as unknown as { hmacSecret?: Buffer }).hmacSecret;
-      const senderDid = hmacSecret ? await sessionDid(db, req.headers.cookie, hmacSecret) : undefined;
-      const authenticated = senderDid !== undefined && senderDid === doc.issuer;
-
-      // 5. proof → indeterminate (never silently allow). The error goes to the authenticated sender
-      //    when there is one (framework 8.1), never to the contested in-band issuer.
-      if (isIndeterminateForProof(doc, authenticated)) {
-        return sendError(reply, doc, new TaskError({ code: 'identityMismatch' }), senderDid);
-      }
-
-      // 6. Route by type.
-      const op = typeUriToOperation(doc.type);
-      if (!op) {
-        return sendError(reply, doc, new TaskError({ code: 'unsupportedType' }));
-      }
-
-      // 7. Dispatch, and wrap the reply. Whatever is thrown is mapped; only a `TaskError` has a
-      //    defined wire form, anything else is logged and answered as an opaque internalError.
-      try {
-        const result = await dispatch(db, op, doc);
-        return reply.send(buildResponse(doc, result));
-      } catch (err) {
-        if (!(err instanceof TaskError)) req.log.error({ err }, 'trust-tasks: unexpected failure');
-        return sendError(reply, doc, err);
-      }
-    },
-  );
+  // The POST route lives in its own encapsulated scope so the raw-body parser applies to it alone.
+  void app.register(async (scope) => {
+    scope.removeContentTypeParser('application/json');
+    scope.addContentTypeParser(
+      'application/json',
+      { parseAs: 'buffer', bodyLimit: DEFAULT_MAX_BODY_BYTES },
+      (_req, body, done) => done(null, body),
+    );
+    scope.post(
+      options.path ?? '/trust-tasks',
+      { bodyLimit: DEFAULT_MAX_BODY_BYTES },
+      async (req: FastifyRequest<{ Body: Buffer | undefined }>, res: FastifyReply) => {
+        const hmacSecret = (app as unknown as { hmacSecret?: Buffer }).hmacSecret;
+        const sender = hmacSecret ? await sessionDid(db, req.headers.cookie, hmacSecret) : undefined;
+        // Only `application/json` is raw-captured; any other content type (Fastify still parses
+        // text/plain, for one) is refused before the pipeline.
+        if (!Buffer.isBuffer(req.body)) {
+          return res.code(415).header('content-type', 'application/json; charset=utf-8').send(
+            JSON.stringify({ code: 'malformedRequest', message: 'The content type must be application/json.', retryable: false }),
+          );
+        }
+        const raw = req.body;
+        const result = await pipeline.process({ raw, sender });
+        options.observe?.(result);
+        return reply(res, result);
+      },
+    );
+  });
 
   // ── GET /trust-tasks/threads — the ceremony task-log index ────────────────
   // One entry per ceremony RUN, newest first. Registered before the `:threadId`
