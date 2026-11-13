@@ -13,9 +13,10 @@
  *
  * ## Served types
  *
- * One handler: the legacy `policy/evaluate` task (core `boundary/legacy-evaluate.ts`), under its
- * internal name `task:p2pts:policy:evaluate:0.1` and its wire form
- * `urn:p2pts:tasks:spec:policy:evaluate:0.1`. Anything else is `unsupportedType`/`unsupportedVersion`.
+ * The legacy `policy/evaluate` task (core `boundary/legacy-evaluate.ts`), under its internal name
+ * `task:p2pts:policy:evaluate:0.1` and its wire form `urn:p2pts:tasks:spec:policy:evaluate:0.1`, and
+ * `trust-task-discovery` 0.4 (core `boundary/discovery.ts`), which lists exactly what is registered.
+ * Anything else, `trust-task-control` included, is `unsupportedType`/`unsupportedVersion`.
  *
  * ## Sender and proof
  *
@@ -66,7 +67,9 @@ import {
   isHostedCommunity,
 } from '@p2p-trust-stack/core/services/trust-tasks/boundary/legacy-evaluate.js';
 import { AcceptedIdStore } from '@p2p-trust-stack/core/services/trust-tasks/boundary/accepted-store.js';
+import { HandlerRegistry } from '@p2p-trust-stack/core/services/trust-tasks/boundary/handlers.js';
 import type { PipelineHandler } from '@p2p-trust-stack/core/services/trust-tasks/boundary/handlers.js';
+import { registerDiscovery } from '@p2p-trust-stack/core/services/trust-tasks/boundary/discovery.js';
 import type { ReplayGuard } from '@p2p-trust-stack/core/services/trust-tasks/boundary/runtime.js';
 import { TrustTaskRecorder } from '@p2p-trust-stack/core/services/trust-tasks/boundary/recorder.js';
 import { DidResolutionService } from '@p2p-trust-stack/core/did/did-resolution-service.js';
@@ -157,7 +160,7 @@ export function registerTrustTaskRoutes(
   const acceptedStore = new AcceptedIdStore(db, options.now === undefined ? {} : { now: options.now });
   const recorder = options.recordDocuments === false ? undefined : new TrustTaskRecorder(db, { node: 'utility-server', onError: (err) => app.log.error({ err }, 'trust-tasks: recording a document failed') });
   const pipeline = new Pipeline({
-    handlers: [createLegacyEvaluateHandler(db), ...(options.extraHandlers ?? [])],
+    handlers: registerDiscovery(new HandlerRegistry([createLegacyEvaluateHandler(db), ...(options.extraHandlers ?? [])])),
     guard: options.guard ?? acceptedStore,
     isServed: (recipient) => isHostedCommunity(db, recipient),
     defaultVid: options.defaultVid ?? (() => getServerNodeInfo()?.did ?? undefined),
