@@ -141,6 +141,38 @@ export class IdentityPushParticipant implements Participant {
   // Persistence logic (mirrors identity-push-server.ts)
   // -----------------------------------------------------------------------
 
+  /**
+   * Archive a conformant (per-VRC relationship DID) credential: the credential row only. No identity
+   * is created or updated, no relationship edge is written, and dedup is by credential digest alone
+   * (a second exchange between the same two identities is a new credential, not a duplicate).
+   * The issuing agent builds this payload without its connection identity record (core
+   * `buildConformantVrcArchivePayload`), so this push does not give the server the mapping from a
+   * relationship DID to a connection DID. A credential whose root identities are unknown here is
+   * skipped, never created from the push.
+   */
+  async applyVrcArchive(archive: { credentials?: IdentityPushPayload['credentials'] }): Promise<number> {
+    let stored = 0;
+    for (const c of archive.credentials ?? []) {
+      if (c.vcType !== 'vrc' || typeof c.w3cVcJson !== 'string' || !c.credentialDigest) continue;
+      const issuer = await this.appDb.get<{ uuid: string }>('SELECT uuid FROM identities WHERE uuid = ?', c.issuerIdentityUuid);
+      const subject = await this.appDb.get<{ uuid: string }>('SELECT uuid FROM identities WHERE uuid = ?', c.subjectIdentityUuid);
+      if (!issuer || !subject) continue;
+      const existing = await this.appDb.get<{ uuid: string }>('SELECT uuid FROM credentials WHERE credential_digest = ?', c.credentialDigest);
+      if (existing) continue;
+      const now = Math.floor(Date.now() / 1000);
+      await this.appDb.run(
+        `INSERT INTO credentials
+          (vc_type, issuer_identity_uuid, subject_identity_uuid, w3c_vc_json, claim, status, threshold_required,
+           valid_from, valid_until, credential_digest, uuid, recorded_by_node, replicated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        c.vcType, issuer.uuid, subject.uuid, c.w3cVcJson, c.claim, c.status, c.thresholdRequired,
+        c.validFrom, c.validUntil, c.credentialDigest, c.uuid, 'agent-push', now, c.createdAt ?? now,
+      );
+      stored++;
+    }
+    return stored;
+  }
+
   private async applyIdentityPush(payload: IdentityPushPayload): Promise<void> {
     const { identity, didDocument } = await createRemoteVta(this.appDb, {
       realDid: payload.realDid,
@@ -301,6 +333,7 @@ export class IdentityPushParticipant implements Participant {
             `SELECT uuid FROM credentials
              WHERE vc_type = 'vrc' AND issuer_identity_uuid = ? AND subject_identity_uuid = ?
                AND w3c_vc_json IS NOT NULL
+               AND w3c_vc_json NOT LIKE '%"issuerScope":"pairwise"%'
              ORDER BY created_at DESC LIMIT 1`,
             issuer.uuid, subject.uuid,
           ) ?? null;
