@@ -47,6 +47,18 @@ export class ExchangePushParticipant implements Participant {
     for (const op of operations) {
       if (op.op !== 'exchange:identity') continue;
       const params = op.params as { payload?: unknown } | undefined;
+      const raw = Array.isArray(params?.payload) ? params?.payload[0] : params?.payload;
+      const archive = (raw as { vrcArchive?: { credentials?: IdentityPushPayload['credentials'] } } | undefined)?.vrcArchive;
+      if (archive && typeof archive === 'object') {
+        // Conformant VRC archive: credential only, no identity record (P5c).
+        try {
+          await this.identityPush.applyVrcArchive(archive);
+        } catch (err) {
+          console.error(`[exchange-push-participant] vrc archive failed for tx ${txId}:`, (err as Error)?.message);
+          return 'no';
+        }
+        continue;
+      }
       const payload = unwrapPayload(params?.payload);
       if (!payload || !payload.realDid) return 'no';
       try {
