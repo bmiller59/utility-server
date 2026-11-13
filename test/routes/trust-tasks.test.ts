@@ -132,24 +132,24 @@ test('a #response document is refused as not-a-request', async () => {
 
 // ── proof / transport attribution ───────────────────────────────────────────
 
-test('a proof with no authenticated issuer is INDETERMINATE (identityMismatch 422, was 401 proof/unattributable; never allow)', async () => {
+test('a proof is refused while no verifier exists (malformedRequest 400, interim policy rejectIfPresent; was identityMismatch for an unattributed proof, 401 before P1)', async () => {
   const { app } = await seed();
   const res = await post(app, env(POLICY_EVALUATE_TYPE, {
     payload: { action: 'register_name' },
     proof: { type: 'Ed25519Signature2020' },
   }));
-  assert.equal(res.statusCode, 422);
-  assert.equal(res.json().payload.code, 'identityMismatch');
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().payload.code, 'malformedRequest');
 });
 
-test('a proof whose issuer IS the session identity is accepted', async () => {
+test('a proof is refused even when its issuer IS the session identity (proof checks are never off; was accepted, the proof ignored)', async () => {
   const { app, adminCookie } = await seed();
   const res = await post(app, env(POLICY_EVALUATE_TYPE, {
     payload: { action: 'register_name' },
     proof: { type: 'Ed25519Signature2020' },
   }), adminCookie);
-  assert.equal(res.statusCode, 200);
-  assert.equal(typeof res.json().payload.result.allowed, 'boolean');
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.json().payload.code, 'malformedRequest');
 });
 
 // ── operations ──────────────────────────────────────────────────────────────
@@ -315,19 +315,21 @@ test('payload.code and payload.message keep their paths (legacy readers) and are
   }
 });
 
-test('a malformed envelope: 400 malformedRequest, threaded on its own id, nothing echoed, no addressing', async () => {
+test('a malformed envelope: 400 malformedRequest, threaded on its own id, no request id echoed', async () => {
   const { app } = await seed();
   const res = await post(app, { type: POLICY_EVALUATE_TYPE, payload: {}, issuer: ADMIN_DID, recipient: CLUB_DID });
   const doc = res.json();
   assert.equal(res.statusCode, 400);
   assert.equal(doc.payload.code, 'malformedRequest');
   assert.equal(doc.threadId, doc.id);
-  assert.equal(doc.recipient, undefined);
-  assert.equal(doc.issuer, undefined);
+  assert.equal(doc.recipient, ADMIN_DID); // the in-band issuer: the suite's reply checks require it, even with no request id
+  assert.equal(doc.issuer, CLUB_DID); // the service answers as itself
   assert.equal(doc.payload.inResponseTo.typeUri, POLICY_EVALUATE_TYPE);
+  // Not an object at all: nothing to address, so a minimal unsigned body that is not a Trust Task document.
   const arr = await post(app, [1, 2]);
   assert.equal(arr.statusCode, 400);
-  assert.equal(arr.json().payload.inResponseTo, undefined);
+  assert.deepEqual(Object.keys(arr.json()).sort(), ['code', 'message', 'retryable']);
+  assert.equal(arr.json().code, 'malformedRequest');
 });
 
 test('a #response document as a request: 400 malformedRequest with a conformant error', async () => {
@@ -368,16 +370,16 @@ test('a missing recipient and a bad evaluate payload are malformedRequest 400 (w
   assert.ok(!JSON.stringify(d3.payload).includes('secret_internal_action_name'), 'the message is a fixed phrase, never the requester\'s text');
 });
 
-test('identityMismatch (proof, unauthenticated): addressed to the in-band issuer when there is no transport sender; no inResponseTo.id', async () => {
+test('a proof with no transport sender: malformedRequest addressed to the in-band issuer (there is no authenticated sender to prefer), request id named', async () => {
   const { app } = await seed();
   const req = env(POLICY_EVALUATE_TYPE, { id: 'doc-im-1', payload: { action: 'register_name' }, proof: { type: 'Ed25519Signature2020' } });
   const res = await post(app, req);
-  assert.equal(res.statusCode, 422);
+  assert.equal(res.statusCode, 400);
   const doc = res.json();
-  assert.equal(doc.payload.code, 'identityMismatch');
+  assert.equal(doc.payload.code, 'malformedRequest');
   assert.equal(doc.recipient, ADMIN_DID);
-  assert.equal(doc.payload.inResponseTo.id, undefined);
-  assert.equal(doc.payload.inResponseTo.typeUri, POLICY_EVALUATE_TYPE);
+  assert.equal(doc.issuer, CLUB_DID);
+  assert.equal(doc.payload.inResponseTo.id, 'doc-im-1');
 });
 
 test('identityMismatch with a session for ANOTHER identity: the error goes to the authenticated sender, never the contested issuer (framework 8.1)', async () => {
