@@ -62,8 +62,14 @@ async function seed(options: TrustTaskRouteOptions & { before?: (app: FastifyIns
   const { before: _before, ...routeOptions } = options;
   registerTrustTaskRoutes(app, ds, { now: () => START, defaultVid: SERVER_DID, observe: (r) => seen.push(r), ...routeOptions });
   await app.ready();
-  return { app, ds, secret, seen, adminCookie: createSession(adminUuid, secret).cookie };
+  const adminCookie = createSession(adminUuid, secret).cookie;
+  // P5 / AUTHZ-001: evaluate needs an authenticated sender, so a request is the admin's unless a test
+  // passes its own `cookie` header (an empty one is "no cookie").
+  defaultCookie = adminCookie;
+  return { app, ds, secret, seen, adminCookie };
 }
+
+let defaultCookie = '';
 
 const doc = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
   id: 'urn:uuid:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
@@ -76,7 +82,7 @@ const doc = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
 });
 
 const post = (app: FastifyInstance, body: unknown, headers: Record<string, string> = {}, url = '/trust-tasks') =>
-  app.inject({ method: 'POST', url, headers: { 'content-type': 'application/json', ...headers }, payload: typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body) });
+  app.inject({ method: 'POST', url, headers: { 'content-type': 'application/json', ...(defaultCookie ? { cookie: defaultCookie } : {}), ...headers }, payload: typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body) });
 
 const code = (res: { json: () => { payload?: { code?: string } } }): string | undefined => res.json().payload?.code;
 
@@ -210,19 +216,31 @@ test('design BND-001: path and method. POST /trust-tasks only; other methods on 
   assert.equal((await post(app, doc())).statusCode, 200);
 });
 
-test('design BND-002: authentication mapping. no cookie, a garbage cookie and a tampered cookie are "no sender"; the session identity is the sender', async () => {
+test('design BND-002: authentication mapping. no cookie, a garbage cookie and a tampered cookie are "no sender" (permissionDenied for evaluate); the session identity is the sender', async () => {
   const { app, adminCookie } = await seed();
-  assert.equal((await post(app, doc())).statusCode, 200);
-  assert.equal((await post(app, doc({ id: 'urn:uuid:11111111-1111-4111-8111-111111111111' }), { cookie: 'session=garbage' })).statusCode, 200);
-  assert.equal((await post(app, doc({ id: 'urn:uuid:22222222-2222-4222-8222-222222222222' }), { cookie: `${adminCookie}x` })).statusCode, 200);
+  assert.equal(code(await post(app, doc(), { cookie: '' })), 'permissionDenied');
+  assert.equal(code(await post(app, doc({ id: 'urn:uuid:11111111-1111-4111-8111-111111111111' }), { cookie: 'session=garbage' })), 'permissionDenied');
+  assert.equal(code(await post(app, doc({ id: 'urn:uuid:22222222-2222-4222-8222-222222222222' }), { cookie: adminCookie.replace(/=([^;])/, (_m, c: string) => `=${c === 'A' ? 'B' : 'A'}`) })), 'permissionDenied');
   assert.equal((await post(app, doc({ id: 'urn:uuid:33333333-3333-4333-8333-333333333333' }), { cookie: adminCookie })).statusCode, 200);
 });
 
-test('design BND-002: unauthenticated evaluate is still answered here (permissionDenied for it is the AUTHZ phase, not P2)', async () => {
+test('AUTHZ-001 (decision C5): unauthenticated evaluate is permissionDenied, 403, a conformant error, and says nothing about the community', async () => {
   const { app } = await seed();
-  const res = await post(app, doc());
-  assert.equal(res.statusCode, 200);
-  assert.equal(typeof res.json().payload.result.allowed, 'boolean');
+  for (const recipient of [CLUB_DID, 'did:scid:vh:somebody-else']) {
+    const res = await post(app, doc({ recipient, id: `urn:uuid:aaaaaaaa-aaaa-4aaa-8aaa-${recipient === CLUB_DID ? '000000000001' : '000000000002'}` }), { cookie: '' });
+    if (recipient === CLUB_DID) {
+      assert.equal(res.statusCode, 403);
+      assert.equal(res.json().payload.code, 'permissionDenied');
+      assert.equal(res.json().payload.retryable, false);
+    }
+  }
+});
+
+test('AUTHZ-001: the verified sender, not the in-band issuer, is the policy actor', async () => {
+  const { app, adminCookie } = await seed();
+  // the cookie is the admin's; an in-band issuer naming someone else is an identity mismatch, never the actor
+  const res = await post(app, doc({ issuer: 'did:scid:vh:somebody-else' }), { cookie: adminCookie });
+  assert.equal(code(res), 'identityMismatch');
 });
 
 test('design BND-003: status table. every outcome maps to the binding status, none is 401 or 404', async () => {

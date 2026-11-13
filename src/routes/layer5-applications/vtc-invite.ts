@@ -47,7 +47,7 @@ import { cesrEncode, CESR_CODES } from '@p2p-trust-stack/core/crypto/cesr.js';
 import * as identitiesRepo from '@p2p-trust-stack/core/db/repositories/identities-repo.js';
 import * as membershipsRepo from '@p2p-trust-stack/core/db/repositories/memberships-repo.js';
 import { DidManager } from '@p2p-trust-stack/core/services/did-manager.js';
-import { driveCeremony } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
+import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
 import { guardAuthorizer } from '@p2p-trust-stack/core/services/trust-tasks/authorizer.js';
 import {
   CEREMONY_MEMBER_INVITATION,
@@ -158,7 +158,7 @@ export function registerVtcInviteRoutes(
         // the mint and every trust-task record commit together, so an invitation is a
         // LOGGED ceremony rather than an untracked side effect.
         const threadId = generateUuid();
-        const driven = await db.transaction((tx) =>
+        const driven = await driveAtomically(db, threadId, (tx) =>
           driveCeremony(tx, CEREMONY_MEMBER_INVITATION, threadId, {
             authorizer: guardAuthorizer(new GovernanceGuard(tx, createPolicyEngine())),
             context: {

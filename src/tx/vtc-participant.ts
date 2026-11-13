@@ -34,7 +34,7 @@ import { cesrEncode, CESR_CODES } from '@p2p-trust-stack/core/crypto/cesr.js';
 import { getServerNodeInfo } from '../services/server-node-info.js';
 import { tryEnqueueFanout } from '../services/exchange-runtime.js';
 import { getNamespaceConfig } from '../services/namespace-service.js';
-import { driveCeremony } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
+import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
 import { guardAuthorizer } from '@p2p-trust-stack/core/services/trust-tasks/authorizer.js';
 import {
   CEREMONY_MEMBER_ONBOARDING,
@@ -141,7 +141,7 @@ export class VtcCreationParticipant implements Participant {
       const issuerDid = community.did ?? communityDid;
       const subjectDid = member.did ?? member.uuid;
       const threadId = generateUuid();
-      const driven = await this.appDb.transaction((tx) =>
+      const driven = await driveAtomically(this.appDb, threadId, (tx) =>
         driveCeremony(tx, CEREMONY_MEMBER_ONBOARDING, threadId, {
           authorizer: guardAuthorizer(new GovernanceGuard(tx, createPolicyEngine())),
           context: {
@@ -166,7 +166,7 @@ export class VtcCreationParticipant implements Participant {
       // a denied gate or a failed mint refuses the acceptance rather than
       // half-admitting the member.
       if (!driven.completed) {
-        throw new Error(`'member-onboarding' ceremony halted at ${driven.haltedAt} (thread ${threadId})`);
+        throw new Error(`'member-onboarding' ceremony halted at ${driven.haltedAt}${driven.haltReason ? `: ${driven.haltReason}` : ''} (thread ${threadId})`);
       }
       const credentialUuid = (driven.outputs[ONBOARDING_VMC_TYPE] as { credentialUuid?: string } | undefined)
         ?.credentialUuid;
@@ -296,7 +296,7 @@ export class VtcCreationParticipant implements Participant {
         // was entitled to grant.
         const threadId = generateUuid();
         const inviterActorDid = inviter?.did ?? inviterDid ?? communityDid;
-        const driven = await this.appDb.transaction((tx) =>
+        const driven = await driveAtomically(this.appDb, threadId, (tx) =>
           driveCeremony(tx, CEREMONY_MEMBER_INVITATION, threadId, {
             authorizer: guardAuthorizer(new GovernanceGuard(tx, createPolicyEngine())),
             context: {

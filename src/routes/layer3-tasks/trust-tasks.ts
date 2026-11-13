@@ -26,8 +26,9 @@
  * verifier (core `boundary/proof/verify.ts`: did:key, did:peer:4, did:scid:vh from the server's
  * rotation logs, never a cached snapshot); a proof that does not verify is `proofInvalid`, a
  * resolution that cannot be completed is `unavailable`. The cookie remains a cross-check only. A
- * caller with no cookie is unauthenticated and is not refused for that (authorisation of evaluate
- * by the verified sender is a later phase). Replies are signed as the server's own DID with the
+ * caller with neither a cookie nor a verified proof is unauthenticated: `policy/evaluate` then
+ * answers `permissionDenied` (403; conformance P5, decision C5), because the verified sender is the
+ * policy actor and an in-band `issuer` alone never is. Replies are signed as the server's own DID with the
  * installed boundary signer (`#key-1`, `authentication`); `TRUST_TASKS_TIER=2` selects the
  * `attested` profile (proof on every request, every reply signed).
  *

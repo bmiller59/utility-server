@@ -160,7 +160,8 @@ test('the default route (evaluate only, no claim) leaves the record empty: no be
   registerTrustTaskRoutes(app, ds, { now: () => T0, defaultVid: SERVER_DID, pruneIntervalMs: 0 });
   await app.ready();
   const res = await post(app, bytes({ type: 'urn:p2pts:tasks:spec:policy:evaluate:0.1', payload: { action: 'register_name' } }));
-  assert.ok([200, 422].includes(res.statusCode));
+  // No cookie: evaluate is permissionDenied (403, conformance P5). Either way, nothing is claimed.
+  assert.ok([200, 403, 422].includes(res.statusCode));
   assert.equal((await ds.all('SELECT * FROM trust_task_accepted')).length, 0);
 });
 

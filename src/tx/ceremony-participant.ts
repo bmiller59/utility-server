@@ -27,6 +27,10 @@ import type {
   Vote,
 } from '@p2p-trust-stack/core/tx/types.js';
 import { CeremonyStore } from '@p2p-trust-stack/core/tx/ceremony-store.js';
+import {
+  assertOpen, assertResettable, closeIfLapsed, describeFailure, isLapsed, recordAbortReason,
+} from '@p2p-trust-stack/core/tx/ceremony-guard.js';
+import { TaskError, taskErrorForReason } from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
 import { createVtc, checkCommunityNameAvailable } from '../services/vtc.js';
 import type { VtcKind, CreateVtcResult } from '../services/vtc.js';
 import * as identitiesRepo from '@p2p-trust-stack/core/db/repositories/identities-repo.js';
@@ -37,7 +41,7 @@ import {
   VTC_ESTABLISH_TYPE, MEMBERSHIP_VMC_TYPE, ONBOARDING_VMC_TYPE, INVITATION_VIC_TYPE,
   CEREMONY_PROPOSE_TYPE, CEREMONY_CO_SIGN_TYPE,
 } from '@p2p-trust-stack/core/services/trust-tasks/type-uris.js';
-import { driveCeremony } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
+import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
 import { registerExecutor } from '@p2p-trust-stack/core/services/trust-tasks/catalog.js';
 import * as trustTasksRepo from '@p2p-trust-stack/core/db/repositories/trust-tasks-repo.js';
 import {
@@ -255,7 +259,7 @@ export class CeremonyCoordinatorParticipant implements Participant {
         } else if (op.op === 'ceremony_reset') {
           const p = op.params as unknown as CeremonyResetParams;
           if (!p?.ceremonyId) return 'no';
-          await this.store.updateStatus(p.ceremonyId, 'aborted');
+          await this.handleReset(p);
         } else if (op.op === 'ceremony_reconcile') {
           const p = op.params as unknown as CeremonyReconcileParams;
           if (!p?.ceremonyId) return 'no';
@@ -263,6 +267,9 @@ export class CeremonyCoordinatorParticipant implements Participant {
         }
       } catch (err) {
         console.error(`[ceremony-participant] prepare failed for tx ${txId}, op ${op.op}:`, (err as Error)?.message);
+        // The 2PC vote carries no reason, so the closed reason (and its standard code) is kept in a
+        // bounded registry keyed by the transaction id for a boundary to read (plan 3.9).
+        recordAbortReason(txId, err);
         return 'no';
       }
     }
@@ -304,8 +311,10 @@ export class CeremonyCoordinatorParticipant implements Participant {
     if (op === 'ceremony_query') {
       const p = params as unknown as CeremonyQueryParams;
       if (!p?.ceremonyId) return { error: 'ceremonyId required' };
-      const proposal = await this.store.getProposal(p.ceremonyId);
-      if (!proposal) return { error: 'ceremony not found' };
+      // A read tells the truth about the deadline: a lapsed pending proposal is stored as expired.
+      const stored = await this.store.getProposal(p.ceremonyId);
+      if (!stored) return { error: 'ceremony not found' };
+      const proposal = await closeIfLapsed(this.store, stored);
       const approvals = await this.store.getApprovals(p.ceremonyId);
       return {
         status: proposal.status,
@@ -316,6 +325,9 @@ export class CeremonyCoordinatorParticipant implements Participant {
         proposalHash: proposal.proposalHash,
         expiresAt: proposal.expiresAt,
         errorReason: proposal.errorReason || null,
+        // Standard Trust Task error code and retryability of a failure (additive; `errorReason` stays).
+        errorCode: proposal.errorCode ?? null,
+        retryable: proposal.retryable ?? null,
         approvals: approvals.map(a => ({
           approverUuid: a.approverDid,
           receivedAt: a.receivedAt,
@@ -329,6 +341,10 @@ export class CeremonyCoordinatorParticipant implements Participant {
       const pending = await this.store.listPending();
       const out: Array<Record<string, unknown>> = [];
       for (const prop of pending) {
+        if (isLapsed(prop)) {
+          await this.store.markExpired(prop.proposalId);
+          continue;
+        }
         const isAdmin = (prop.adminUuids ?? []).includes(p.adminUuid)
           || prop.proposerUuid === p.adminUuid;
         if (!isAdmin) continue;
@@ -371,9 +387,25 @@ export class CeremonyCoordinatorParticipant implements Participant {
     const now = Date.now();
     const expiresAt = now + 7 * 24 * 60 * 60 * 1000;
 
-    // Reject if a ceremony with this ID already exists (idempotency guard)
+    // Duplicate begin (framework 7.2 item 11): the same ceremony id with the same content is the
+    // same request, so it returns the existing state and changes nothing; the same id with other
+    // content conflicts. (The proposal hash covers a fresh deadline, so content is compared by field.)
     const existing = await this.store.getProposal(ceremonyId);
-    if (existing) throw new Error(`ceremony ${ceremonyId.slice(0, 8)} already exists`);
+    if (existing) {
+      const same = existing.name === p.name
+        && existing.kind === (p.kind ?? 'vtc')
+        && existing.threshold === (p.threshold ?? 1)
+        && (existing.proposerUuid ?? existing.proposerDid) === p.proposerUuid
+        && (existing.parentCommunityDid ?? null) === (p.parentCommunityUuid ?? null)
+        && JSON.stringify([...(existing.adminUuids.length > 0 ? existing.adminUuids : existing.adminDids)].sort())
+          === JSON.stringify([...p.adminUuids].sort());
+      if (same) return;
+      throw new TaskError({
+        code: 'idConflict',
+        retryable: false,
+        internalMessage: `ceremony ${ceremonyId.slice(0, 8)} already exists with different content`,
+      });
+    }
 
     const canonical = JSON.stringify({
       ceremonyId,
@@ -443,9 +475,31 @@ export class CeremonyCoordinatorParticipant implements Participant {
   }
 
   private async handleApprove(p: CeremonyApproveParams): Promise<void> {
-    const proposal = await this.store.getProposal(p.ceremonyId);
-    if (!proposal) throw new Error(`ceremony ${p.ceremonyId} not found`);
-    if (proposal.status !== 'pending') throw new Error(`ceremony is ${proposal.status}`);
+    const stored = await this.store.getProposal(p.ceremonyId);
+    // A missing ceremony and an approver who may not act on it are the same answer on the wire.
+    if (!stored) {
+      throw taskErrorForReason('notFoundOrNotPermitted', { internalMessage: `ceremony ${p.ceremonyId} not found` });
+    }
+
+    // Who may approve is decided first, before anything about the ceremony's state is revealed.
+    const declaredAdmins = new Set<string>([
+      ...(stored.adminUuids ?? []),
+      ...(stored.adminDids ?? []),
+    ]);
+    if (stored.proposerUuid) declaredAdmins.add(stored.proposerUuid);
+
+    // A repeated approval by the same approver is idempotent: no second log row, no error.
+    // (Also after the ceremony committed; a first approval after that is refused below.)
+    if (declaredAdmins.has(p.approverUuid)
+      && (stored.status === 'crystallized' || (stored.status === 'pending' && !isLapsed(stored)))) {
+      const prior = await this.store.getApprovals(p.ceremonyId);
+      if (prior.some((a) => a.approverDid === p.approverUuid)) return;
+    }
+
+    // One rule for "still open" (deadline reached = lapsed, `>=`). A late approval flips the
+    // stored status to `expired` before it is refused, so the next query reports the truth.
+    const proposal = await closeIfLapsed(this.store, stored);
+    if (declaredAdmins.has(p.approverUuid)) assertOpen(proposal);
 
     // GovernanceGuard gap-closure (admin-set membership). An arbitrary
     // `approverUuid` used to be recorded and counted, so a caller could inflate the
@@ -457,11 +511,6 @@ export class CeremonyCoordinatorParticipant implements Participant {
     //
     // The SAME set is the co-signature quorum: every declared admin must accept, so
     // "who may sign" and "how many must sign" are one list by definition.
-    const declaredAdmins = new Set<string>([
-      ...(proposal.adminUuids ?? []),
-      ...(proposal.adminDids ?? []),
-    ]);
-    if (proposal.proposerUuid) declaredAdmins.add(proposal.proposerUuid);
     const required = Math.max(declaredAdmins.size, 1);
 
     // Record the ATTEMPT first — a refused co-signature is exactly the kind of event
@@ -495,7 +544,9 @@ export class CeremonyCoordinatorParticipant implements Participant {
       } catch (err) {
         console.warn(`[ceremony-participant] denial audit row not written: ${(err as Error)?.message ?? err}`);
       }
-      throw new Error(`approver ${p.approverUuid} is not a founding admin of this ceremony`);
+      throw taskErrorForReason('notFoundOrNotPermitted', {
+        internalMessage: `approver ${p.approverUuid} is not a founding admin of this ceremony`,
+      });
     }
 
     await this.store.recordApproval(p.ceremonyId, p.approverUuid, p.signature);
@@ -561,16 +612,13 @@ export class CeremonyCoordinatorParticipant implements Participant {
   private async crystallize(ceremonyId: string): Promise<void> {
     const proposal = await this.store.getProposal(ceremonyId);
     if (!proposal) throw new Error(`ceremony ${ceremonyId} not found`);
+    assertOpen(await closeIfLapsed(this.store, proposal));
 
     try {
       const avail = await checkCommunityNameAvailable(this.appDb, proposal.name);
       if (!avail.available) {
-        await this.store.updateStatus(ceremonyId, 'failed');
-        await this.txDb.run(
-          `UPDATE ceremony_proposals SET error_reason = ? WHERE proposal_id = ?`,
-          `Name "${proposal.name}" is already taken.`, ceremonyId,
-        );
-        throw new Error(`Name "${proposal.name}" is already taken.`);
+        await this.store.markFailed(ceremonyId, `Name "${proposal.name}" is already taken.`, 'taskFailed', false);
+        throw taskErrorForReason('nameTaken', { internalMessage: `Name "${proposal.name}" is already taken.` });
       }
 
       // GovernanceGuard gap-closure (parent-VTN policy). The parent VTN's own
@@ -583,12 +631,8 @@ export class CeremonyCoordinatorParticipant implements Participant {
       const parentCheck = await new GovernanceGuard(this.appDb, createPolicyEngine())
         .validateParentVtnPolicy(proposal.parentCommunityDid, proposal.kind);
       if (!parentCheck.allowed) {
-        await this.store.updateStatus(ceremonyId, 'failed');
-        await this.txDb.run(
-          `UPDATE ceremony_proposals SET error_reason = ? WHERE proposal_id = ?`,
-          `Parent VTN policy denied: ${parentCheck.reason}`, ceremonyId,
-        );
-        throw new Error(`Parent VTN policy denied: ${parentCheck.reason}`);
+        await this.store.markFailed(ceremonyId, `Parent VTN policy denied: ${parentCheck.reason}`, 'permissionDenied', false);
+        throw taskErrorForReason('policyDenied', { internalMessage: `Parent VTN policy denied: ${parentCheck.reason}` });
       }
 
       // GovernanceGuard gap-closure (crystallization authorization). This is the
@@ -641,12 +685,8 @@ export class CeremonyCoordinatorParticipant implements Participant {
           );
           return;
         }
-        await this.store.updateStatus(ceremonyId, 'failed');
-        await this.txDb.run(
-          `UPDATE ceremony_proposals SET error_reason = ? WHERE proposal_id = ?`,
-          `Crystallization denied: ${decision.reason ?? 'policy'}`, ceremonyId,
-        );
-        throw new Error(`Crystallization denied: ${decision.reason ?? 'policy'}`);
+        await this.store.markFailed(ceremonyId, `Crystallization denied: ${decision.reason ?? 'policy'}`, 'permissionDenied', false);
+        throw taskErrorForReason('policyDenied', { internalMessage: `Crystallization denied: ${decision.reason ?? 'policy'}` });
       }
 
       const identityUuids: string[] = [];
@@ -670,7 +710,7 @@ export class CeremonyCoordinatorParticipant implements Participant {
         identityUuids.push(identity.uuid);
       }
 
-      const result = await this.appDb.transaction(async (tx) => {
+      const result = await driveAtomically(this.appDb, ceremonyId, async (tx) => {
         // An ATOMIC driven ceremony: createVtc + every step's trust-task record commit
         // together, or not at all. The gate is createVtc's own validation (name/endpoint/
         // VRC/threshold), which throws and rolls back the transaction on failure.
@@ -685,7 +725,7 @@ export class CeremonyCoordinatorParticipant implements Participant {
           },
         });
         if (!drive.completed) {
-          throw new Error(`ceremony 'vtc-establish' halted at ${drive.haltedAt}`);
+          throw new Error(`ceremony 'vtc-establish' halted at ${drive.haltedAt}${drive.haltReason ? `: ${drive.haltReason}` : ''}`);
         }
         return drive.outputs[VTC_ESTABLISH_TYPE] as CreateVtcResult;
       });
@@ -707,14 +747,29 @@ export class CeremonyCoordinatorParticipant implements Participant {
       console.log(`[ceremony-participant] crystallized ${ceremonyId.slice(0, 8)} → VTC '${result.identity.name}'`);
 
     } catch (err) {
+      // Every failure leaves the proposal `failed` with its reason text AND its standard code, so a
+      // client reads `errorCode`/`retryable` instead of parsing the text. Keep a code a deeper step
+      // already stored (the markFailed calls above); otherwise derive it from the error.
       const msg = (err as Error)?.message ?? 'Unknown error';
-      await this.store.updateStatus(ceremonyId, 'failed');
-      await this.txDb.run(
-        `UPDATE ceremony_proposals SET error_reason = ? WHERE proposal_id = ?`,
-        msg, ceremonyId,
-      );
+      const current = await this.store.getProposal(ceremonyId);
+      if (current?.status === 'failed' && current.errorCode) throw err;
+      const f = describeFailure(err);
+      await this.store.markFailed(ceremonyId, msg, f.code, f.retryable);
       throw err;
     }
+  }
+
+  /**
+   * `ceremony_reset`: only a `failed` or `expired` ceremony can be set aside for a retry. A pending
+   * ceremony is still live (its co-signatures would be thrown away) and a crystallized one has
+   * already created the community: both are refused, the latter as `alreadyCommitted`.
+   */
+  private async handleReset(p: CeremonyResetParams): Promise<void> {
+    const stored = await this.store.getProposal(p.ceremonyId);
+    if (!stored) throw taskErrorForReason('notFound', { internalMessage: `ceremony ${p.ceremonyId} not found` });
+    const proposal = await closeIfLapsed(this.store, stored);
+    assertResettable(proposal);
+    await this.store.updateStatus(p.ceremonyId, 'aborted');
   }
 
   private async handleReconcile(p: CeremonyReconcileParams): Promise<void> {

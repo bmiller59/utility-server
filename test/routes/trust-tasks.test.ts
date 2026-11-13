@@ -69,6 +69,9 @@ async function seed(): Promise<{ app: FastifyInstance; ds: SqliteDataSource; clu
   await app.ready();
 
   const adminCookie = createSession(adminUuid, secret).cookie;
+  // P5 / AUTHZ-001: evaluate needs an authenticated sender, so a request is the admin's unless a test
+  // passes its own cookie (the empty string is "no cookie").
+  defaultCookie = adminCookie;
   return { app, ds, clubUuid, adminUuid, secret, adminCookie };
 }
 
@@ -85,11 +88,14 @@ function env(type: string, over: Record<string, unknown> = {}): Record<string, u
   };
 }
 
+let defaultCookie = '';
+
 async function post(app: FastifyInstance, body: unknown, cookie?: string) {
+  const effective = cookie === undefined ? defaultCookie : cookie;
   return app.inject({
     method: 'POST',
     url: '/trust-tasks',
-    headers: { ...(cookie ? { cookie } : {}) },
+    headers: { ...(effective ? { cookie: effective } : {}) },
     payload: body as object,
   });
 }
@@ -435,7 +441,13 @@ test('RSP-001/RSP-002: a success reply continues the request thread, or names on
 
 test('catch-all: an unexpected failure is an opaque internalError 500 trust-task-error, not the framework handler body', async () => {
   const { app, ds } = await seed();
-  ds.getRawDb().close(); // every later query throws a driver error naming internals
+  // Every query after the session lookup (the first read) throws a driver error naming internals.
+  const realGet = ds.get.bind(ds);
+  let reads = 0;
+  (ds as unknown as { get: unknown }).get = async (...args: Parameters<typeof ds.get>) => {
+    if (reads++ > 0) throw new Error('SQLITE_MISUSE: database is not open');
+    return realGet(...args);
+  };
   const req = env(POLICY_EVALUATE_TYPE, { id: 'doc-boom', payload: { action: 'register_name' } });
   const res = await post(app, req);
   assert.equal(res.statusCode, 500);
