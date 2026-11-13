@@ -132,24 +132,24 @@ test('a #response document is refused as not-a-request', async () => {
 
 // ── proof / transport attribution ───────────────────────────────────────────
 
-test('a proof is refused while no verifier exists (malformedRequest 400, interim policy rejectIfPresent; was identityMismatch for an unattributed proof, 401 before P1)', async () => {
+test('a proof that does not verify is proofInvalid (422); was malformedRequest under the interim rejectIfPresent policy, identityMismatch for an unattributed proof before P2, 401 before P1', async () => {
   const { app } = await seed();
   const res = await post(app, env(POLICY_EVALUATE_TYPE, {
     payload: { action: 'register_name' },
     proof: { type: 'Ed25519Signature2020' },
   }));
-  assert.equal(res.statusCode, 400);
-  assert.equal(res.json().payload.code, 'malformedRequest');
+  assert.equal(res.statusCode, 422);
+  assert.equal(res.json().payload.code, 'proofInvalid');
 });
 
-test('a proof is refused even when its issuer IS the session identity (proof checks are never off; was accepted, the proof ignored)', async () => {
+test('a proof that does not verify is refused even when its issuer IS the session identity (proof checks are never off; was accepted, the proof ignored)', async () => {
   const { app, adminCookie } = await seed();
   const res = await post(app, env(POLICY_EVALUATE_TYPE, {
     payload: { action: 'register_name' },
     proof: { type: 'Ed25519Signature2020' },
   }), adminCookie);
-  assert.equal(res.statusCode, 400);
-  assert.equal(res.json().payload.code, 'malformedRequest');
+  assert.equal(res.statusCode, 422);
+  assert.equal(res.json().payload.code, 'proofInvalid');
 });
 
 // ── operations ──────────────────────────────────────────────────────────────
@@ -370,13 +370,13 @@ test('a missing recipient and a bad evaluate payload are malformedRequest 400 (w
   assert.ok(!JSON.stringify(d3.payload).includes('secret_internal_action_name'), 'the message is a fixed phrase, never the requester\'s text');
 });
 
-test('a proof with no transport sender: malformedRequest addressed to the in-band issuer (there is no authenticated sender to prefer), request id named', async () => {
+test('a proof that does not verify, with no transport sender: proofInvalid addressed to the in-band issuer (there is no authenticated sender to prefer), request id named', async () => {
   const { app } = await seed();
   const req = env(POLICY_EVALUATE_TYPE, { id: 'doc-im-1', payload: { action: 'register_name' }, proof: { type: 'Ed25519Signature2020' } });
   const res = await post(app, req);
-  assert.equal(res.statusCode, 400);
+  assert.equal(res.statusCode, 422);
   const doc = res.json();
-  assert.equal(doc.payload.code, 'malformedRequest');
+  assert.equal(doc.payload.code, 'proofInvalid');
   assert.equal(doc.recipient, ADMIN_DID);
   assert.equal(doc.issuer, CLUB_DID);
   assert.equal(doc.payload.inResponseTo.id, 'doc-im-1');

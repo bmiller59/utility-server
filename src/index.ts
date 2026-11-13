@@ -47,6 +47,8 @@ import { setExchangeEngine } from './services/exchange-runtime.js';
 import { setServerNodeInfo, setServerNodeDid } from './services/server-node-info.js';
 import { setOobiSignerFromKey } from '@p2p-trust-stack/core/relationship/oobi-signer.js';
 import { setLocalOperationSigner } from '@p2p-trust-stack/core/tx/operation-proof.js';
+import { installBoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
+import { generateEd25519KeyPairFromSeed } from '@p2p-trust-stack/core/crypto/primitives.js';
 import { setBootstrapClient } from './services/bootstrap-info.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
 import { createPolicyEngine } from '@p2p-trust-stack/core/services/policy-engine-config.js';
@@ -521,6 +523,20 @@ async function main(): Promise<void> {
       secretKey: tspIdentity.signingSecretKey,
     });
     console.log(`[utility-server] operation proofs: signing as ${vta.tspVid.slice(0, 12)}…`);
+    // Trust Task boundary signer (conformance P4), beside the operation-proof signer: replies are
+    // signed as this server's DID with `#key-1` (the permanent TSP key on the Slot-A layout),
+    // installed only when the identifier's document publishes exactly the key held here.
+    const boundaryKey = generateEd25519KeyPairFromSeed(tspIdentity.signingSecretKey);
+    const boundary = installBoundarySigner({
+      did: vta.realDid,
+      didDocument: tspIdentity.didDocument,
+      keys: () => boundaryKey,
+    });
+    console.log(
+      boundary.installed
+        ? `[utility-server] Trust Task documents: signing as ${vta.realDid.slice(0, 24)}… (#key-1)`
+        : `[utility-server] Trust Task documents: NOT signing (${boundary.reason})`,
+    );
   } else {
     console.log(
       '[utility-server] operation proofs: NOT signing (no TSP VID / signing key) — ' +

@@ -21,10 +21,14 @@
  *
  * The authenticated sender is the session cookie's identity. A document whose in-band `issuer`
  * differs from it is `identityMismatch`, addressed to the authenticated sender (framework 8.1).
- * Proof checks are never off: until the DID-resolving verifier lands a document carrying a `proof`
- * is refused (`malformedRequest`, interim policy `rejectIfPresent`), cookie or not. A caller with
- * no cookie is unauthenticated and is not refused for that (authorisation of evaluate by the
- * verified sender is a later phase).
+ * Proof checks are never off: a document carrying a `proof` is verified by the DID-resolving
+ * verifier (core `boundary/proof/verify.ts`: did:key, did:peer:4, did:scid:vh from the server's
+ * rotation logs, never a cached snapshot); a proof that does not verify is `proofInvalid`, a
+ * resolution that cannot be completed is `unavailable`. The cookie remains a cross-check only. A
+ * caller with no cookie is unauthenticated and is not refused for that (authorisation of evaluate
+ * by the verified sender is a later phase). Replies are signed as the server's own DID with the
+ * installed boundary signer (`#key-1`, `authentication`); `TRUST_TASKS_TIER=2` selects the
+ * `attested` profile (proof on every request, every reply signed).
  *
  * ## Strictness (one release)
  *
@@ -64,13 +68,34 @@ import {
 import { AcceptedIdStore } from '@p2p-trust-stack/core/services/trust-tasks/boundary/accepted-store.js';
 import type { PipelineHandler } from '@p2p-trust-stack/core/services/trust-tasks/boundary/handlers.js';
 import type { ReplayGuard } from '@p2p-trust-stack/core/services/trust-tasks/boundary/runtime.js';
+import { DidResolutionService } from '@p2p-trust-stack/core/did/did-resolution-service.js';
+import { DidProofVerifier } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/verify.js';
+import { createServerKeyResolver } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
+import { getBoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/signer.js';
+import type { BoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/signer.js';
+import { getServerNodeInfo } from '../../services/server-node-info.js';
 import { validateSession } from '../../session.js';
 
 export interface TrustTaskRouteOptions {
   /** Default: `TRUST_TASKS_STRICTNESS` (`lenient` or `strict`), else `strict`. */
   strictness?: Strictness;
-  /** The identifier errors are issued by when the document names no hosted community. */
+  /**
+   * The identifier replies and errors are issued by when the document names no hosted community.
+   * Default: the server's own DID (`getServerNodeInfo().did`, recorded at startup from the server's
+   * VTA identity, the same identifier its boundary signer signs as); unset in processes that have
+   * not recorded one (tests), where the pre-P4 fallback applies.
+   */
   defaultVid?: string;
+  /**
+   * 1 (default): proofs are verified when present, unsigned requests to tasks that do not require a
+   * proof stay accepted. 2: the `attested` profile (proof required on every request, purpose pinned,
+   * every reply signed). Default from `TRUST_TASKS_TIER` (`2` selects the attested profile).
+   */
+  tier?: 1 | 2;
+  /** Replies are signed with this identity; default the process's installed boundary signer. */
+  signer?: BoundarySigner | (() => BoundarySigner | undefined);
+  /** The proof verifier; default one resolving did:key, did:peer:4 and did:scid:vh (log only, never a cached snapshot). */
+  verifier?: DidProofVerifier;
   /** Default `/trust-tasks`; deployments differ on paths (HTTPS binding). */
   path?: string;
   /** Test hook: the clock, epoch milliseconds. */
@@ -87,6 +112,10 @@ export interface TrustTaskRouteOptions {
   pruneIntervalMs?: number;
   /** Test hook: sees every pipeline result (raw bytes included) before the reply is sent. */
   observe?: (result: PipelineResult) => void;
+}
+
+export function tierFromEnv(value: string | undefined): 1 | 2 {
+  return value === '2' ? 2 : 1;
 }
 
 export function strictnessFromEnv(value: string | undefined): Strictness {
@@ -124,7 +153,12 @@ export function registerTrustTaskRoutes(
     handlers: [createLegacyEvaluateHandler(db), ...(options.extraHandlers ?? [])],
     guard: options.guard ?? acceptedStore,
     isServed: (recipient) => isHostedCommunity(db, recipient),
-    ...(options.defaultVid === undefined ? {} : { defaultVid: options.defaultVid }),
+    defaultVid: options.defaultVid ?? (() => getServerNodeInfo()?.did ?? undefined),
+    proof: {
+      verifier: options.verifier ?? new DidProofVerifier({ resolver: createServerKeyResolver(new DidResolutionService(db)) }),
+      tier: options.tier ?? tierFromEnv(process.env.TRUST_TASKS_TIER),
+    },
+    signer: options.signer ?? getBoundarySigner,
     ...(options.now === undefined ? {} : { now: options.now }),
     strictness,
     onUnexpected: (err) => app.log.error({ err }, 'trust-tasks: unexpected failure'),
