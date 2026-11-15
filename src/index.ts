@@ -52,6 +52,7 @@ import { boundaryKeyModeRequested, installProcessBoundarySigner } from '@p2p-tru
 import { formatBoundaryEvent } from '@p2p-trust-stack/core/services/trust-tasks/boundary/process-config.js';
 import { SqliteKeyStore } from '@p2p-trust-stack/core/keystore/sqlite-keystore.js';
 import { startUtilityBoundaryListener } from './trust-tasks-listener.js';
+import { resolveBoundaryKeystorePath, resolveDataDir, withPublishedBoundaryKey } from './services/boundary-key-admin.js';
 import { generateEd25519KeyPairFromSeed } from '@p2p-trust-stack/core/crypto/primitives.js';
 import { setBootstrapClient } from './services/bootstrap-info.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
@@ -188,7 +189,7 @@ async function main(): Promise<void> {
 
   // ── libp2p node ──────────────────────────────────────────────────────
 
-  const dataDir = join(__dirname, '..', 'data');
+  const dataDir = resolveDataDir(process.env, join(__dirname, '..', 'data'));
   const configPath = join(dataDir, 'config.json');
 
   // Load or generate the persisted identity seeds. Three independent seeds:
@@ -536,12 +537,17 @@ async function main(): Promise<void> {
       // document that does not publish it stops the server before it serves anything; it never falls
       // back to #key-1. The key lives in the encrypted key store under the seed passphrase.
       const passphrase = resolveSeedPassphrase();
-      const keystore = new SqliteKeyStore(process.env.BOUNDARY_KEYSTORE_PATH ?? join(dirname(configPath), 'boundary-keystore.db'));
+      const keystore = new SqliteKeyStore(resolveBoundaryKeystorePath(process.env, dataDir));
       try {
+        // The runtime document is built locally and carries no #key-boundary; the publication lives in
+        // the server's own rotation log, so the check reads the boundary method from the latest entry.
+        const publishedDocument = vta.didDocumentUuid === null || vta.didDocumentUuid === undefined
+          ? tspIdentity.didDocument
+          : await withPublishedBoundaryKey(ds, vta.didDocumentUuid, tspIdentity.didDocument);
         const out = await installProcessBoundarySigner({
           env: process.env,
           did: vta.realDid,
-          didDocument: tspIdentity.didDocument,
+          didDocument: publishedDocument,
           keys: () => boundaryKey,
           ...(passphrase === undefined ? {} : { custody: { store: keystore, passphrase } }),
         });

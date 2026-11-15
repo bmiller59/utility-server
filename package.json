@@ -9,6 +9,7 @@
     "start": "node --experimental-strip-types --loader ./test-loader.mjs src/index.ts",
     "dev": "node --experimental-strip-types --loader ./test-loader.mjs --watch src/index.ts",
     "migrate": "node --experimental-strip-types --loader ./test-loader.mjs src/scripts/migrate.ts",
+    "boundary-key": "node --experimental-strip-types --loader ./test-loader.mjs src/scripts/boundary-key.ts",
     "routes": "node --experimental-strip-types --loader ./test-loader.mjs src/scripts/list-routes.ts",
     "reconcile:identities": "node --experimental-strip-types --loader ./test-loader.mjs src/scripts/reconcile-identities.ts",
     "init:bootstrap": "node --experimental-strip-types --loader ./test-loader.mjs ./scripts/init-bootstrap-env.ts",
