@@ -15,12 +15,13 @@ import { registerStatusListRoutes } from './status-lists.js';
 import { registerNonceRoutes } from './nonces.js';
 import { registerAuthRoutes } from './auth.js';
 import { registerTrustTaskRoutes } from './trust-tasks.js';
+import type { TrustTaskRouteOptions } from './trust-tasks.js';
 
-export function registerLayer3Routes(app: FastifyInstance, db: DataSource): void {
+export function registerLayer3Routes(app: FastifyInstance, db: DataSource, trustTasks: TrustTaskRouteOptions = {}): void {
   registerCredentialRoutes(app, db);
   registerStatusListRoutes(app, db);
   registerNonceRoutes(app, db);
   registerAuthRoutes(app, db);
-  registerTrustTaskRoutes(app, db);
+  registerTrustTaskRoutes(app, db, trustTasks);
 }
 

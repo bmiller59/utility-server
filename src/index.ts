@@ -52,6 +52,8 @@ import { boundaryKeyModeRequested, installProcessBoundarySigner } from '@p2p-tru
 import { formatBoundaryEvent } from '@p2p-trust-stack/core/services/trust-tasks/boundary/process-config.js';
 import { SqliteKeyStore } from '@p2p-trust-stack/core/keystore/sqlite-keystore.js';
 import { startUtilityBoundaryListener } from './trust-tasks-listener.js';
+import { ceremonyHostRequested, createCeremonyHost } from './services/ceremony-host.js';
+import type { TrustTaskRouteOptions } from './routes/layer3-tasks/trust-tasks.js';
 import { resolveBoundaryKeystorePath, resolveDataDir } from './services/boundary-key-admin.js';
 import { reconcileBoundaryKey } from './services/boundary-document-sync.js';
 import { generateEd25519KeyPairFromSeed } from '@p2p-trust-stack/core/crypto/primitives.js';
@@ -933,6 +935,21 @@ async function main(): Promise<void> {
   });
   connectivitySupervisor.start();
 
+  // ── Founding-ceremony documents on the boundary (opt-in, default off) ───
+  // `TRUST_TASKS_CEREMONY_HOST=1` serves ceremony:propose / co-sign / status / reset on `POST /trust-tasks` (and on the
+  // dedicated listener, when that is on) with this server's real establishing effect. A bad value refuses to start.
+  // Prepared ceremony transactions the coordinator decided are finished once here, after the fan-out engine is wired.
+  let trustTaskRoutes: TrustTaskRouteOptions | undefined;
+  if (!setupMode && ceremonyHostRequested(process.env)) {
+    const ceremonyHost = createCeremonyHost({ appDb: ds, txDb: tx.txDataSource, txManager: tx.manager, serverId: 'us-1' });
+    const reconciled = await ceremonyHost.reconcile();
+    console.log(
+      `[utility-server] ceremony documents: served on the Trust Task boundary` +
+      ` (reconciled ${reconciled.committed.length} committed, ${reconciled.aborted.length} aborted, ${reconciled.failed.length} failed)`,
+    );
+    trustTaskRoutes = { extraHandlers: ceremonyHost.handlers, guard: ceremonyHost.guard };
+  }
+
   // ── HTTP API ─────────────────────────────────────────────────────────
 
   const app = buildServer({
@@ -950,6 +967,7 @@ async function main(): Promise<void> {
     }),
     tspAdapter,
     setupMode,
+    ...(trustTaskRoutes === undefined ? {} : { trustTaskRoutes }),
     // Operator surface: GET /health/connectivity. The supervisor already owns all
     // of this state; before this it had no production caller at all, so none of it
     // was reachable outside the logs.
@@ -982,6 +1000,7 @@ async function main(): Promise<void> {
         db: ds,
         env: process.env,
         forbiddenPorts: [httpPort, ...(config.resolverEnabled ? [config.resolverPort] : [])],
+        ...(trustTaskRoutes === undefined ? {} : { routeOptions: trustTaskRoutes }),
       });
     } catch (err) {
       console.error(formatBoundaryEvent('listener.refused', { reason: (err as Error).message }));

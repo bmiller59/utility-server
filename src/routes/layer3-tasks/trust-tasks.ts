@@ -16,6 +16,8 @@
  * The legacy `policy/evaluate` task (core `boundary/legacy-evaluate.ts`), under its internal name
  * `task:p2pts:policy:evaluate:0.1` and its wire form `urn:p2pts:tasks:spec:policy:evaluate:0.1`, and
  * `trust-task-discovery` 0.4 (core `boundary/discovery.ts`), which lists exactly what is registered.
+ * With `TRUST_TASKS_CEREMONY_HOST=1` the founding-ceremony documents (`ceremony:propose`, `ceremony:co-sign`, `ceremony:status`,
+ * `ceremony:reset`) are served too, through `extraHandlers` (`services/ceremony-host.ts`), and discovery lists them.
  * Anything else, `trust-task-control` included, is `unsupportedType`/`unsupportedVersion`.
  *
  * ## Sender and proof

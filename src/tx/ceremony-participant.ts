@@ -31,14 +31,15 @@ import {
   assertOpen, assertResettable, closeIfLapsed, describeFailure, isLapsed, recordAbortReason,
 } from '@p2p-trust-stack/core/tx/ceremony-guard.js';
 import { TaskError, taskErrorForReason } from '@p2p-trust-stack/core/services/trust-tasks/boundary/errors.js';
-import { createVtc, checkCommunityNameAvailable } from '../services/vtc.js';
+import { checkCommunityNameAvailable } from '../services/vtc.js';
 import type { VtcKind, CreateVtcResult } from '../services/vtc.js';
+import { registerFoundingExecutors } from '@p2p-trust-stack/core/services/founding/executors.js';
+import { resolveRealVtaForStub } from '@p2p-trust-stack/core/services/founding/admin-resolution.js';
 import * as identitiesRepo from '@p2p-trust-stack/core/db/repositories/identities-repo.js';
 import { tryEnqueueFanout } from '../services/exchange-runtime.js';
 import { enqueueFoundingAdminVmcFanout } from '../services/vtc-push-data.js';
-import type { MembershipRow } from '@p2p-trust-stack/core/db/repositories/memberships-repo.js';
 import {
-  VTC_ESTABLISH_TYPE, MEMBERSHIP_VMC_TYPE, ONBOARDING_VMC_TYPE, INVITATION_VIC_TYPE,
+  VTC_ESTABLISH_TYPE, ONBOARDING_VMC_TYPE, INVITATION_VIC_TYPE,
   CEREMONY_PROPOSE_TYPE, CEREMONY_CO_SIGN_TYPE,
 } from '@p2p-trust-stack/core/services/trust-tasks/type-uris.js';
 import { driveCeremony, driveAtomically } from '@p2p-trust-stack/core/services/trust-tasks/driver.js';
@@ -58,42 +59,11 @@ import { createPolicyEngine } from '@p2p-trust-stack/core/services/policy-engine
 import { DidManager } from '@p2p-trust-stack/core/services/did-manager.js';
 
 // ── Registry: the founding-ceremony effect executors ─────────────────────────
-// Ceremony DEFINITIONS live in the DB (0019); an effect step's EXECUTOR lives in
-// code (src/services/trust-tasks/catalog.ts). The utility server registers ITS
-// executors at import time — idempotent (Map.set), so re-import is a no-op.
-//
-// The establishment gate is createVtc's own validation (unique name, human-VTA +
-// active-endpoint + mutual-VRC + threshold checks) — it throws and rolls back the
-// surrounding transaction; no separate `policy` step is needed for the founding flow.
-registerExecutor(VTC_ESTABLISH_TYPE, async (context) => {
-  const db = context.db as DataSource;
-  const result = await createVtc(db, {
-    name: context.name as string,
-    kind: context.kind as VtcKind,
-    adminIdentityUuids: context.adminIdentityUuids as string[],
-    threshold: context.threshold as number | undefined,
-    parentCommunityUuid: context.parentCommunityUuid as string | undefined,
-  });
-  // The response's recipient is the community this step just established.
-  return { ...result, recipientDid: result.identity.did ?? undefined };
-});
-
-registerExecutor(MEMBERSHIP_VMC_TYPE, async (context) => {
-  const admin = context.item as MembershipRow;
-  const db = context.db as DataSource;
-  // The founding VMC is minted *inside* createVtc (memberships.membership_credential_uuid);
-  // this step documents one already-minted credential per founding admin, fed by the
-  // establish step's output (`repeat: "$…vtc:establish:0.1#foundingAdmins"`). Its
-  // recipient is the member who holds the credential.
-  const member = await identitiesRepo.findByUuid(db, admin.memberIdentityUuid);
-  return {
-    membershipUuid: admin.uuid,
-    memberIdentityUuid: admin.memberIdentityUuid,
-    membershipCredentialUuid: admin.membershipCredentialUuid,
-    role: admin.role,
-    recipientDid: member?.did ?? undefined,
-  };
-});
+// Ceremony DEFINITIONS live in the DB (0019); an effect step's EXECUTOR lives in code. The two founding steps
+// (`vtc:establish`, `membership-vmc`) are core's, shared with the boundary ceremony host so both doors run the same
+// steps; registration is idempotent (Map.set), so re-import is a no-op. The establishment gate is createVtc's own
+// validation (unique name, human-VTA + active-endpoint + mutual-VRC + threshold checks).
+registerFoundingExecutors();
 
 // ── Registry: the member-onboarding ceremony's effect executor ───────────────
 // `member-onboarding` (migration 0020) is the policy-GATED ceremony: its first step
@@ -790,94 +760,11 @@ export class CeremonyCoordinatorParticipant implements Participant {
   }
 
   /**
-   * Resolve the authoritative (did:scid:vh) identity that shares the same
-   * Ed25519 public key as an endpoint-less did:peer:4 stub identity. The
-   * utility server's TSP bridge creates such stubs (no active peer_endpoint)
-   * when recording the relationship handshake, keyed by the peer's did:peer:4
-   * VID — a DIFFERENT identity row from the agent's real did:scid:vh VTA.
-   * createVtc requires an active libp2p endpoint on every founding admin, so
-   * we map the stub to its real VTA.
+   * Resolve the authoritative (did:scid:vh) identity that shares the DID or Ed25519 key of an endpoint-less did:peer:4 stub
+   * (the TSP bridge's relationship-handshake row). `createVtc` requires an active libp2p endpoint on every founding admin.
+   * The rule is core's (`resolveRealVtaForStub`), shared with the boundary ceremony host.
    */
-  private async resolveRealVtaForStub(db: DataSource, stubUuid: string): Promise<{ uuid: string } | null> {
-    const hex = (b: Buffer | Uint8Array | null | undefined): string =>
-      b && b.length > 0 ? Buffer.from(b).toString('hex') : '<none>';
-
-    // Dump the stub's DIDs and keys.
-    const stubDids = await db.all<{ did: string; method: string; is_primary: number }>(
-      `SELECT d.did, d.method, d.is_primary FROM did_documents d WHERE d.identity_uuid = $1`, stubUuid,
-    );
-    const stubKeys = await db.all<{ key_type: string; public_key: Buffer }>(
-      `SELECT key_type, public_key FROM keys WHERE identity_uuid = $1`, stubUuid,
-    );
-    console.log(
-      `[ceremony-participant] resolveRealVtaForStub stub=${stubUuid}`,
-    );
-    for (const d of stubDids) {
-      console.log(`[ceremony-participant]   stub.did (${d.method}, primary=${d.is_primary}) = ${d.did}`);
-    }
-    for (const k of stubKeys) {
-      console.log(`[ceremony-participant]   stub.key ${k.key_type} = ${hex(k.public_key)}`);
-    }
-
-    // Dump every VTA identity (excluding the stub) with its DIDs, keys, endpoint.
-    const others = await db.all<{ uuid: string; name: string | null; has_endpoint: number }>(
-      `SELECT i.uuid, i.name,
-              (SELECT 1 FROM peer_endpoints pe WHERE pe.identity_uuid = i.uuid LIMIT 1) AS has_endpoint
-       FROM identities i
-       WHERE i.role = 'vta' AND i.uuid <> $1
-       ORDER BY i.created_at, i.uuid`, stubUuid,
-    );
-    for (const o of others) {
-      const oDids = await db.all<{ did: string; method: string }>(
-        `SELECT d.did, d.method FROM did_documents d WHERE d.identity_uuid = $1`, o.uuid,
-      );
-      const oKeys = await db.all<{ key_type: string; public_key: Buffer }>(
-        `SELECT key_type, public_key FROM keys WHERE identity_uuid = $1`, o.uuid,
-      );
-      console.log(
-        `[ceremony-participant]   candidate uuid=${o.uuid} name=${JSON.stringify(o.name ?? null)} ` +
-        `endpoint=${o.has_endpoint ? 'yes' : 'no'}`,
-      );
-      for (const d of oDids) {
-        console.log(`[ceremony-participant]     cand.did (${d.method}) = ${d.did}`);
-      }
-      for (const k of oKeys) {
-        console.log(`[ceremony-participant]     cand.key ${k.key_type} = ${hex(k.public_key)}`);
-      }
-    }
-
-    // Resolve by shared DID first (authoritative), then by shared key (ed25519 OR x25519).
-    const realByDid = await db.get<{ uuid: string }>(
-      `SELECT i.uuid FROM identities i
-       JOIN did_documents d ON d.identity_uuid = i.uuid
-       WHERE i.role = 'vta' AND i.uuid <> $1
-         AND d.did IN (SELECT dd.did FROM did_documents dd WHERE dd.identity_uuid = $1)
-         AND EXISTS (SELECT 1 FROM peer_endpoints pe WHERE pe.identity_uuid = i.uuid)
-       ORDER BY i.created_at, i.uuid
-       LIMIT 1`,
-      stubUuid,
-    );
-    if (realByDid) {
-      console.log(`[ceremony-participant] resolveRealVtaForStub → real (by DID) = ${realByDid.uuid}`);
-      return realByDid;
-    }
-
-    const real = await db.get<{ uuid: string }>(
-      `SELECT i.uuid FROM identities i
-       JOIN keys k ON k.identity_uuid = i.uuid
-       JOIN keys k2 ON k2.public_key = k.public_key AND k2.key_type = k.key_type
-       JOIN identities i2 ON i2.uuid = k2.identity_uuid
-       JOIN peer_endpoints pe ON pe.identity_uuid = i.uuid
-       WHERE i2.uuid = $1 AND i.role = 'vta' AND i.uuid <> $1
-       ORDER BY i.created_at, i.uuid
-       LIMIT 1`,
-      stubUuid,
-    );
-    if (real) {
-      console.log(`[ceremony-participant] resolveRealVtaForStub → real (by key) = ${real.uuid}`);
-    } else {
-      console.log(`[ceremony-participant] resolveRealVtaForStub → NO real VTA (no DID or key match)`);
-    }
-    return real ?? null;
+  private resolveRealVtaForStub(db: DataSource, stubUuid: string): Promise<{ uuid: string } | null> {
+    return resolveRealVtaForStub(db, stubUuid);
   }
 }

@@ -68,6 +68,8 @@ export interface AppDeps {
    * explicit "not available" (503) instead of a silently empty payload.
    */
   getConnectivityStatus?: () => import('./services/connectivity-supervisor.js').SupervisorStatus;
+  /** Extra options for `POST /trust-tasks` (the opt-in ceremony host's handlers and duplicate record). Unset: the route serves what it always did. */
+  trustTaskRoutes?: import('./routes/layer3-tasks/trust-tasks.js').TrustTaskRouteOptions;
 }
 
 export function buildServer(deps: AppDeps): FastifyInstance {
@@ -104,7 +106,7 @@ export function buildServer(deps: AppDeps): FastifyInstance {
   registerLayer2Routes(app, deps.db, deps.node, deps.keyStorePath);
 
   // Layer 3 — Trust Tasks
-  registerLayer3Routes(app, deps.db);
+  registerLayer3Routes(app, deps.db, deps.trustTaskRoutes);
 
   // Layer 4 — Governance
   registerLayer4Routes(app, deps.db);
