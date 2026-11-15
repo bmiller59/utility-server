@@ -61,6 +61,9 @@ import {
   createLegacyEvaluateHandler,
   isHostedCommunity,
 } from '@p2p-trust-stack/core/services/trust-tasks/boundary/legacy-evaluate.js';
+import { AcceptedIdStore } from '@p2p-trust-stack/core/services/trust-tasks/boundary/accepted-store.js';
+import type { PipelineHandler } from '@p2p-trust-stack/core/services/trust-tasks/boundary/handlers.js';
+import type { ReplayGuard } from '@p2p-trust-stack/core/services/trust-tasks/boundary/runtime.js';
 import { validateSession } from '../../session.js';
 
 export interface TrustTaskRouteOptions {
@@ -72,6 +75,16 @@ export interface TrustTaskRouteOptions {
   path?: string;
   /** Test hook: the clock, epoch milliseconds. */
   now?: () => number;
+  /**
+   * Duplicate record for consequential handlers. Default: the durable `AcceptedIdStore` over the
+   * application database (table `trust_task_accepted`, migration 0021). Today only the read-only
+   * evaluate task is served, which takes no claim, so the default changes no behaviour.
+   */
+  guard?: ReplayGuard;
+  /** Further handlers beside the legacy evaluate handler (tests; later phases register theirs here). */
+  extraHandlers?: readonly PipelineHandler[];
+  /** How often closed duplicate-record windows are pruned, ms. Default 10 minutes; 0 disables. */
+  pruneIntervalMs?: number;
   /** Test hook: sees every pipeline result (raw bytes included) before the reply is sent. */
   observe?: (result: PipelineResult) => void;
 }
@@ -106,8 +119,10 @@ export function registerTrustTaskRoutes(
   options: TrustTaskRouteOptions = {},
 ): void {
   const strictness = options.strictness ?? strictnessFromEnv(process.env.TRUST_TASKS_STRICTNESS);
+  const acceptedStore = new AcceptedIdStore(db, options.now === undefined ? {} : { now: options.now });
   const pipeline = new Pipeline({
-    handlers: [createLegacyEvaluateHandler(db)],
+    handlers: [createLegacyEvaluateHandler(db), ...(options.extraHandlers ?? [])],
+    guard: options.guard ?? acceptedStore,
     isServed: (recipient) => isHostedCommunity(db, recipient),
     ...(options.defaultVid === undefined ? {} : { defaultVid: options.defaultVid }),
     ...(options.now === undefined ? {} : { now: options.now }),
@@ -116,6 +131,17 @@ export function registerTrustTaskRoutes(
     onLenient: (event) => app.log.warn({ event }, 'trust-tasks: lenient strictness let a document through'),
     maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
   });
+
+  // Janitor hook: drop duplicate-record rows whose window has closed. Unref'd, stopped on close; a failed
+  // pass is logged and retried on the next tick.
+  const pruneIntervalMs = options.pruneIntervalMs ?? 10 * 60_000;
+  if (pruneIntervalMs > 0) {
+    const timer = setInterval(() => {
+      acceptedStore.pruneExpired().catch((err: unknown) => app.log.error({ err }, 'trust-tasks: pruning the duplicate record failed'));
+    }, pruneIntervalMs);
+    timer.unref();
+    app.addHook('onClose', async () => clearInterval(timer));
+  }
 
   // The POST route lives in its own encapsulated scope so the raw-body parser applies to it alone.
   void app.register(async (scope) => {
