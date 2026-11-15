@@ -48,6 +48,10 @@ import { setServerNodeInfo, setServerNodeDid } from './services/server-node-info
 import { setOobiSignerFromKey } from '@p2p-trust-stack/core/relationship/oobi-signer.js';
 import { setLocalOperationSigner } from '@p2p-trust-stack/core/tx/operation-proof.js';
 import { installBoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
+import { boundaryKeyModeRequested, installProcessBoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/key-custody.js';
+import { formatBoundaryEvent } from '@p2p-trust-stack/core/services/trust-tasks/boundary/process-config.js';
+import { SqliteKeyStore } from '@p2p-trust-stack/core/keystore/sqlite-keystore.js';
+import { startUtilityBoundaryListener } from './trust-tasks-listener.js';
 import { generateEd25519KeyPairFromSeed } from '@p2p-trust-stack/core/crypto/primitives.js';
 import { setBootstrapClient } from './services/bootstrap-info.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
@@ -527,17 +531,45 @@ async function main(): Promise<void> {
     // signed as this server's DID with `#key-1` (the permanent TSP key on the Slot-A layout),
     // installed only when the identifier's document publishes exactly the key held here.
     const boundaryKey = generateEd25519KeyPairFromSeed(tspIdentity.signingSecretKey);
-    const boundary = installBoundarySigner({
-      did: vta.realDid,
-      didDocument: tspIdentity.didDocument,
-      keys: () => boundaryKey,
-    });
-    console.log(
-      boundary.installed
-        ? `[utility-server] Trust Task documents: signing as ${vta.realDid.slice(0, 24)}… (#key-1)`
-        : `[utility-server] Trust Task documents: NOT signing (${boundary.reason})`,
-    );
+    if (boundaryKeyModeRequested(process.env)) {
+      // Dedicated boundary key (gate G2): fail closed. A bad gate, a missing or unreadable key, or a
+      // document that does not publish it stops the server before it serves anything; it never falls
+      // back to #key-1. The key lives in the encrypted key store under the seed passphrase.
+      const passphrase = resolveSeedPassphrase();
+      const keystore = new SqliteKeyStore(process.env.BOUNDARY_KEYSTORE_PATH ?? join(dirname(configPath), 'boundary-keystore.db'));
+      try {
+        const out = await installProcessBoundarySigner({
+          env: process.env,
+          did: vta.realDid,
+          didDocument: tspIdentity.didDocument,
+          keys: () => boundaryKey,
+          ...(passphrase === undefined ? {} : { custody: { store: keystore, passphrase } }),
+        });
+        if (out.mode === 'dedicated') {
+          console.log(formatBoundaryEvent('signer.installed', { keyMode: 'dedicated', generation: out.generation, fingerprint: out.fingerprint, cutoverAt: new Date(out.cutoverAtMs).toISOString() }));
+        }
+      } catch (err) {
+        console.error(formatBoundaryEvent('startup.refused', { reason: (err as Error).message, keyMode: 'dedicated' }));
+        throw err;
+      } finally {
+        keystore.close();
+      }
+    } else {
+      const boundary = installBoundarySigner({
+        did: vta.realDid,
+        didDocument: tspIdentity.didDocument,
+        keys: () => boundaryKey,
+      });
+      console.log(
+        boundary.installed
+          ? `[utility-server] Trust Task documents: signing as ${vta.realDid.slice(0, 24)}… (#key-1)`
+          : `[utility-server] Trust Task documents: NOT signing (${boundary.reason})`,
+      );
+    }
   } else {
+    if (boundaryKeyModeRequested(process.env)) {
+      throw new Error('dedicated boundary key mode is on but the server has no TSP signing identity to attach it to; refusing to start');
+    }
     console.log(
       '[utility-server] operation proofs: NOT signing (no TSP VID / signing key) — ' +
       'peers with TSP_OPERATION_PROOF_POLICY=enforce will refuse this node\'s tx_prepare',
@@ -921,6 +953,21 @@ async function main(): Promise<void> {
     console.log('[utility-server] DID resolver disabled (RESOLVER_ENABLED=0)');
   }
 
+  // ── Trust Task listener (opt-in, own port, Tier 2 by default) ─────────────
+  let boundaryListener: Awaited<ReturnType<typeof startUtilityBoundaryListener>>;
+  if (!setupMode) {
+    try {
+      boundaryListener = await startUtilityBoundaryListener({
+        db: ds,
+        env: process.env,
+        forbiddenPorts: [httpPort, ...(config.resolverEnabled ? [config.resolverPort] : [])],
+      });
+    } catch (err) {
+      console.error(formatBoundaryEvent('listener.refused', { reason: (err as Error).message }));
+      throw err;
+    }
+  }
+
   let shuttingDown = false;
   const shutdown = async (reason: 'setup-complete' | 'signal' = 'signal') => {
     if (shuttingDown) return; // guard against a signal racing the setup exit
@@ -944,6 +991,7 @@ async function main(): Promise<void> {
     if (agentDeliveryQueue) agentDeliveryQueue.stop();
     if (tspAdapter) tspAdapter.destroy();
     await tx.shutdown();
+    if (boundaryListener) await boundaryListener.close();
     if (resolverApp) await resolverApp.close();
     await app.close();
     await node.stop();

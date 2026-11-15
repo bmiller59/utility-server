@@ -75,7 +75,9 @@ import type { ReplayGuard } from '@p2p-trust-stack/core/services/trust-tasks/bou
 import { TrustTaskRecorder } from '@p2p-trust-stack/core/services/trust-tasks/boundary/recorder.js';
 import { DidResolutionService } from '@p2p-trust-stack/core/did/did-resolution-service.js';
 import { DidProofVerifier } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/verify.js';
-import { createServerKeyResolver } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
+import { boundaryKeyModeRequested, resolveBoundaryProcessKeyConfig } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/key-custody.js';
+import { keyPolicyOf } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/key-config.js';
+import { createServerKeyResolver, createTimePinnedServerKeyResolver } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/install.js';
 import { getBoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/signer.js';
 import type { BoundarySigner } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/signer.js';
 import { getServerNodeInfo } from '../../services/server-node-info.js';
@@ -122,6 +124,11 @@ export interface TrustTaskRouteOptions {
   pruneIntervalMs?: number;
   /** Test hook: sees every pipeline result (raw bytes included) before the reply is sent. */
   observe?: (result: PipelineResult) => void;
+  /**
+   * Serve the read routes (`GET /trust-tasks/threads`, `GET /trust-tasks/:threadId`) beside the POST route.
+   * Default true. The dedicated boundary listener turns it off: it carries the document surface only.
+   */
+  readRoutes?: boolean;
 }
 
 export function tierFromEnv(value: string | undefined): 1 | 2 {
@@ -152,6 +159,20 @@ function reply(res: FastifyReply, result: PipelineResult) {
   return res.header('content-type', 'application/json; charset=utf-8').send(JSON.stringify(body));
 }
 
+/**
+ * The default proof verifier. Unset gate (the default): exactly the verifier this route always had. Dedicated
+ * boundary key mode (gate G2): did:scid:vh key sets are taken from the validated log at `proof.created`
+ * and the freshness and #key-1 retirement policy applies. A bad gate value throws (the caller refuses to start).
+ */
+export function defaultVerifier(db: DataSource): DidProofVerifier {
+  if (boundaryKeyModeRequested(process.env)) {
+    const { config } = resolveBoundaryProcessKeyConfig(process.env);
+    const keyPolicy = keyPolicyOf(config);
+    return new DidProofVerifier({ resolver: createTimePinnedServerKeyResolver(new DidResolutionService(db)), ...(keyPolicy === undefined ? {} : { keyPolicy }) });
+  }
+  return new DidProofVerifier({ resolver: createServerKeyResolver(new DidResolutionService(db)) });
+}
+
 export function registerTrustTaskRoutes(
   app: FastifyInstance,
   db: DataSource,
@@ -166,7 +187,7 @@ export function registerTrustTaskRoutes(
     isServed: (recipient) => isHostedCommunity(db, recipient),
     defaultVid: options.defaultVid ?? (() => getServerNodeInfo()?.did ?? undefined),
     proof: {
-      verifier: options.verifier ?? new DidProofVerifier({ resolver: createServerKeyResolver(new DidResolutionService(db)) }),
+      verifier: options.verifier ?? defaultVerifier(db),
       tier: options.tier ?? tierFromEnv(process.env.TRUST_TASKS_TIER),
     },
     signer: options.signer ?? getBoundarySigner,
@@ -217,6 +238,8 @@ export function registerTrustTaskRoutes(
       },
     );
   });
+
+  if (options.readRoutes === false) return;
 
   // ── GET /trust-tasks/threads — the ceremony task-log index ────────────────
   // One entry per ceremony RUN, newest first. Registered before the `:threadId`
