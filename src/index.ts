@@ -52,7 +52,8 @@ import { boundaryKeyModeRequested, installProcessBoundarySigner } from '@p2p-tru
 import { formatBoundaryEvent } from '@p2p-trust-stack/core/services/trust-tasks/boundary/process-config.js';
 import { SqliteKeyStore } from '@p2p-trust-stack/core/keystore/sqlite-keystore.js';
 import { startUtilityBoundaryListener } from './trust-tasks-listener.js';
-import { resolveBoundaryKeystorePath, resolveDataDir, withPublishedBoundaryKey } from './services/boundary-key-admin.js';
+import { resolveBoundaryKeystorePath, resolveDataDir } from './services/boundary-key-admin.js';
+import { reconcileBoundaryKey } from './services/boundary-document-sync.js';
 import { generateEd25519KeyPairFromSeed } from '@p2p-trust-stack/core/crypto/primitives.js';
 import { setBootstrapClient } from './services/bootstrap-info.js';
 import { GovernanceGuard } from '@p2p-trust-stack/core/services/governance-guard.js';
@@ -532,6 +533,14 @@ async function main(): Promise<void> {
     // signed as this server's DID with `#key-1` (the permanent TSP key on the Slot-A layout),
     // installed only when the identifier's document publishes exactly the key held here.
     const boundaryKey = generateEd25519KeyPairFromSeed(tspIdentity.signingSecretKey);
+    const identityForBoundary = tspIdentity;
+    const reconcileServedBoundaryKey = async (dedicated: boolean): Promise<DidDocument> => {
+      if (vta.didDocumentUuid === null || vta.didDocumentUuid === undefined) return identityForBoundary.didDocument;
+      const sync = await reconcileBoundaryKey(ds, { didDocumentUuid: vta.didDocumentUuid, did: vta.realDid, served: identityForBoundary.didDocument, dedicated });
+      identityForBoundary.didDocument = sync.document;
+      if (sync.action === 'repaired') console.log(`[utility-server] boundary key: document_json repaired from the rotation log head (endpoints kept)`);
+      return sync.document;
+    };
     if (boundaryKeyModeRequested(process.env)) {
       // Dedicated boundary key (gate G2): fail closed. A bad gate, a missing or unreadable key, or a
       // document that does not publish it stops the server before it serves anything; it never falls
@@ -539,11 +548,10 @@ async function main(): Promise<void> {
       const passphrase = resolveSeedPassphrase();
       const keystore = new SqliteKeyStore(resolveBoundaryKeystorePath(process.env, dataDir));
       try {
-        // The runtime document is built locally and carries no #key-boundary; the publication lives in
-        // the server's own rotation log, so the check reads the boundary method from the latest entry.
-        const publishedDocument = vta.didDocumentUuid === null || vta.didDocumentUuid === undefined
-          ? tspIdentity.didDocument
-          : await withPublishedBoundaryKey(ds, vta.didDocumentUuid, tspIdentity.didDocument);
+        // The cached document may lack #key-boundary (the publication lives in the server's own rotation log).
+        // K4: the boundary method is taken over from the log head into the document served in the handshake
+        // and into document_json (merged, endpoints kept); an invalid log or row stops the server here.
+        const publishedDocument = await reconcileServedBoundaryKey(true);
         const out = await installProcessBoundarySigner({
           env: process.env,
           did: vta.realDid,
@@ -561,6 +569,13 @@ async function main(): Promise<void> {
         keystore.close();
       }
     } else {
+      // Gate off: the document served in the handshake and cached still lists a published #key-boundary
+      // (K4); a problem here is logged and never stops the server, since nothing signs with that key.
+      try {
+        await reconcileServedBoundaryKey(false);
+      } catch (err) {
+        console.warn(`[utility-server] boundary key document sync skipped: ${(err as Error).message}`);
+      }
       const boundary = installBoundarySigner({
         did: vta.realDid,
         didDocument: tspIdentity.didDocument,

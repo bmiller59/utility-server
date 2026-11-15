@@ -12,6 +12,9 @@
  *   - the listener starts on its own port and signs with the dedicated key;
  *   - a Tier 2 signed document is accepted and the reply is signed by `<server did>#key-boundary`;
  *   - the reply verifies against the key the server's own log publishes;
+ *   - K4: the cached `did_documents.document_json` is repaired from the rotation log head at boot (gate off and
+ *     gate on), keeping the live endpoint and every other column of the row; an invalid log chain repairs
+ *     nothing, stops a dedicated server and only warns with the gate off;
  *   - with the gate on and the key store gone, or with a mistyped gate value, the server refuses to start
  *     and binds nothing.
  *
@@ -35,6 +38,7 @@ import type { KeyResolver } from '@p2p-trust-stack/core/services/trust-tasks/bou
 import { createEd25519BoundarySigner, signDocument } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/signer.js';
 import { YugabyteDataSource } from '../../src/db/yugabyte-data-source.js';
 import { readPublishedBoundaryKey } from '../../src/services/boundary-key-admin.js';
+import { YugabyteRotationLogStore } from '../../src/db/yugabyte-rotation-log-store.js';
 
 const ROOT = join(import.meta.dirname, '..', '..');
 const LOADER = pathToFileURL(join(ROOT, 'test-loader.mjs')).href;
@@ -143,6 +147,36 @@ after(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+const openDb = () => new YugabyteDataSource({ host: '127.0.0.1', port: pgPort, database: 'p2pts', user: 'yugabyte', password: 'yugabyte', poolMin: 1, poolMax: 2 });
+interface DocLike { verificationMethod: Array<{ id: string; publicKeyMultibase?: string }>; authentication: string[]; service?: Array<{ id: string }> }
+/** The server's primary did_documents row: all columns, and its parsed document. */
+async function readRow(): Promise<{ row: Record<string, unknown>; doc: DocLike }> {
+  const ds = openDb();
+  try {
+    const row = (await ds.get<Record<string, unknown>>('SELECT * FROM did_documents WHERE did = ?', serverDid))!;
+    return { row, doc: JSON.parse(row.document_json as string) as DocLike };
+  } finally { await ds.close(); }
+}
+async function writeRowDoc(mutate: (d: DocLike) => void): Promise<void> {
+  const ds = openDb();
+  try {
+    const row = (await ds.get<{ document_json: string }>('SELECT document_json FROM did_documents WHERE did = ?', serverDid))!;
+    const doc = JSON.parse(row.document_json) as DocLike;
+    mutate(doc);
+    await ds.run('UPDATE did_documents SET document_json = ? WHERE did = ?', JSON.stringify(doc), serverDid);
+  } finally { await ds.close(); }
+}
+async function headBoundaryMultibase(): Promise<string> {
+  const ds = openDb();
+  try {
+    const row = (await ds.get<{ uuid: string }>('SELECT uuid FROM did_documents WHERE did = ?', serverDid))!;
+    const log = await new YugabyteRotationLogStore(ds).getLog(row.uuid);
+    return log[log.length - 1]!.didDocument.verificationMethod.find((v) => v.id === '#key-boundary')!.publicKeyMultibase;
+  } finally { await ds.close(); }
+}
+const stripBoundary = (d: DocLike) => { d.verificationMethod = d.verificationMethod.filter((v) => v.id !== '#key-boundary'); d.authentication = d.authentication.filter((a) => a !== '#key-boundary'); };
+const LIVE = { id: '#live-transport', type: 'TspTransport', serviceEndpoint: 'https://live.example/tsp' };
+
 const server = (extra: Record<string, string> = {}): Proc => run([join(ROOT, 'src', 'index.ts')], { ...env, ...extra }, dir);
 const cli = (args: string[], extra: Record<string, string> = {}): Promise<{ code: number | null; out: string; all: string }> => {
   const p = run([join(ROOT, 'src', 'scripts', 'boundary-key.ts'), ...args], { ...env, ...extra }, dir);
@@ -178,6 +212,36 @@ test('boot', { skip, timeout: 600_000 }, async (t) => {
     assert.equal(/secret|seed|passphrase/i.test(prov.all + pub.all), false, 'no key material in the output');
   });
 
+  await t.test('2b. K4, gate off: a stale document_json is repaired from the log head at boot; the live endpoint and every other column stay', async () => {
+    await writeRowDoc((d) => { d.service = [...(d.service ?? []), LIVE as never]; });
+    const before = await readRow();
+    assert.equal(before.doc.verificationMethod.some((v) => v.id === '#key-boundary'), false, 'stale: the row has no #key-boundary');
+    const s = server();
+    try {
+      await s.waitFor(/HTTP API listening/, 120_000);
+      assert.ok(s.lines.some((l) => /boundary key: document_json repaired/.test(l)), s.lines.slice(-10).join('\n'));
+      assert.ok(s.lines.some((l) => /Trust Task documents: signing as .*\(#key-1\)/.test(l)), 'still signs with #key-1 (K7: signing changes only at the cutover)');
+    } finally { await s.stop(); }
+    const after = await readRow();
+    const head = await headBoundaryMultibase();
+    assert.equal(after.doc.verificationMethod.find((v) => v.id === '#key-boundary')?.publicKeyMultibase, head);
+    assert.ok(after.doc.authentication.includes('#key-boundary'));
+    assert.ok(after.doc.service?.some((x) => x.id === LIVE.id), 'live endpoint kept');
+    const strip = (r: { row: Record<string, unknown> }) => ({ ...r.row, document_json: null });
+    assert.deepEqual(strip(after), strip(before), 'no other column of the row changes');
+    const second = server();
+    try {
+      await second.waitFor(/HTTP API listening/, 120_000);
+      assert.equal(second.lines.some((l) => /document_json repaired/.test(l)), false, 'consistent: nothing written at the next boot');
+    } finally { await second.stop(); }
+    assert.deepEqual((await readRow()).row, after.row);
+  });
+
+  await t.test('2c. the row goes stale again (key removed, endpoint kept)', async () => {
+    await writeRowDoc(stripBoundary);
+    assert.equal((await readRow()).doc.verificationMethod.some((v) => v.id === '#key-boundary'), false);
+  });
+
   await t.test('3. gate on: the listener starts on its own port with the dedicated key; a Tier 2 signed document is accepted; the reply is signed by #key-boundary', async () => {
     const s = server({
       TRUST_TASKS_BOUNDARY_KEY: 'dedicated', BOUNDARY_KEY_CUTOVER_AT: new Date(Date.now() - 3_600_000).toISOString(),
@@ -191,6 +255,7 @@ test('boot', { skip, timeout: 600_000 }, async (t) => {
       assert.match(started, /"signer":"dedicated"/);
       assert.match(started, /"tier":2/);
       await s.waitFor(/HTTP API listening/, 120_000);
+      assert.ok(s.lines.some((l) => /boundary key: document_json repaired/.test(l)), 'K4: repaired from the log head at boot with the gate on');
       assert.notEqual(ports.listener, ports.http);
 
       const secretKey = new Uint8Array(32).fill(5);
@@ -250,5 +315,26 @@ test('boot', { skip, timeout: 600_000 }, async (t) => {
     assert.ok(typeof code === 'number' && code !== 0, String(code));
     assert.ok(s.lines.some((l) => /"event":"startup\.refused"/.test(l)));
     assert.equal(s.lines.some((l) => /HTTP API listening/.test(l)), false);
+  });
+  await t.test('6. K4, invalid log chain: gate on refuses to start and repairs nothing; gate off warns, serves, and repairs nothing', async () => {
+    await writeRowDoc(stripBoundary);
+    const ds = openDb();
+    try {
+      await ds.run('UPDATE rotation_log SET created_at = created_at + 1 WHERE version = (SELECT MAX(version) FROM rotation_log)');
+    } finally { await ds.close(); }
+    const before = await readRow();
+    const dedicated = server({ TRUST_TASKS_BOUNDARY_KEY: 'dedicated', BOUNDARY_KEY_CUTOVER_AT: new Date(Date.now() - 3_600_000).toISOString(), TRUST_TASKS_LISTENER: '1', TRUST_TASKS_LISTENER_PORT: String(ports.listener) });
+    const code = await exitOrTimeout(dedicated);
+    await dedicated.stop();
+    assert.ok(typeof code === 'number' && code !== 0, String(code));
+    assert.ok(dedicated.lines.some((l) => /"event":"startup\.refused"/.test(l) && /rotation log chain is not valid/.test(l)), dedicated.lines.slice(-10).join('\n'));
+    assert.equal(dedicated.lines.some((l) => /HTTP API listening|listener\.started|signer\.installed/.test(l)), false);
+    assert.deepEqual((await readRow()).row, before.row, 'nothing repaired');
+    const off = server();
+    try {
+      await off.waitFor(/HTTP API listening/, 120_000);
+      assert.ok(off.lines.some((l) => /rotation log chain is not valid/.test(l)), 'a warning names the problem');
+    } finally { await off.stop(); }
+    assert.deepEqual((await readRow()).row, before.row, 'nothing repaired with the gate off either');
   });
 });

@@ -39,6 +39,7 @@ import {
 } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/key-custody.js';
 import type { BoundaryKeyStore } from '@p2p-trust-stack/core/services/trust-tasks/boundary/proof/key-custody.js';
 import { YugabyteRotationLogStore } from '../db/yugabyte-rotation-log-store.js';
+import { overlayBoundaryKey } from './boundary-document-sync.js';
 
 export type BoundaryAdminCommand = 'provision' | 'publish' | 'rotate' | 'retire' | 'destroy' | 'status';
 
@@ -137,15 +138,7 @@ export async function withPublishedBoundaryKey(db: DataSource, didDocumentUuid: 
   const log = await new YugabyteRotationLogStore(db).getLog(didDocumentUuid);
   const last = log[log.length - 1];
   if (last === undefined) throw new BoundaryKeyError('notPublished', 'the server\'s rotation log is empty');
-  const vm = last.didDocument.verificationMethod.find((v) => v.id === BOUNDARY_VM_ID);
-  const doc = structuredClone(local);
-  doc.verificationMethod = doc.verificationMethod.filter((v) => v.id !== BOUNDARY_VM_ID);
-  doc.authentication = (doc.authentication ?? []).filter((a) => a !== BOUNDARY_VM_ID);
-  if (vm !== undefined) {
-    doc.verificationMethod.push({ ...vm });
-    if (last.didDocument.authentication?.includes(BOUNDARY_VM_ID) === true) doc.authentication = [...doc.authentication, BOUNDARY_VM_ID];
-  }
-  return doc;
+  return overlayBoundaryKey(local, last.didDocument);
 }
 
 async function heldGenerations(ctx: BoundaryAdminContext, passphrase: string, upTo = 16): Promise<number[]> {
