@@ -749,10 +749,10 @@ export class CeremonyCoordinatorParticipant implements Participant {
 
     // Dump the stub's DIDs and keys.
     const stubDids = await db.all<{ did: string; method: string; is_primary: number }>(
-      `SELECT d.did, d.method, d.is_primary FROM did_documents d WHERE d.identity_uuid = $1`, stubUuid,
+      `SELECT d.did, d.method, d.is_primary FROM did_documents d WHERE d.identity_uuid = ?`, stubUuid,
     );
     const stubKeys = await db.all<{ key_type: string; public_key: Buffer }>(
-      `SELECT key_type, public_key FROM keys WHERE identity_uuid = $1`, stubUuid,
+      `SELECT key_type, public_key FROM keys WHERE identity_uuid = ?`, stubUuid,
     );
     console.log(
       `[ceremony-participant] resolveRealVtaForStub stub=${stubUuid}`,
@@ -769,15 +769,15 @@ export class CeremonyCoordinatorParticipant implements Participant {
       `SELECT i.uuid, i.name,
               (SELECT 1 FROM peer_endpoints pe WHERE pe.identity_uuid = i.uuid LIMIT 1) AS has_endpoint
        FROM identities i
-       WHERE i.role = 'vta' AND i.uuid <> $1
+       WHERE i.role = 'vta' AND i.uuid <> ?
        ORDER BY i.created_at, i.uuid`, stubUuid,
     );
     for (const o of others) {
       const oDids = await db.all<{ did: string; method: string }>(
-        `SELECT d.did, d.method FROM did_documents d WHERE d.identity_uuid = $1`, o.uuid,
+        `SELECT d.did, d.method FROM did_documents d WHERE d.identity_uuid = ?`, o.uuid,
       );
       const oKeys = await db.all<{ key_type: string; public_key: Buffer }>(
-        `SELECT key_type, public_key FROM keys WHERE identity_uuid = $1`, o.uuid,
+        `SELECT key_type, public_key FROM keys WHERE identity_uuid = ?`, o.uuid,
       );
       console.log(
         `[ceremony-participant]   candidate uuid=${o.uuid} name=${JSON.stringify(o.name ?? null)} ` +
@@ -795,12 +795,14 @@ export class CeremonyCoordinatorParticipant implements Participant {
     const realByDid = await db.get<{ uuid: string }>(
       `SELECT i.uuid FROM identities i
        JOIN did_documents d ON d.identity_uuid = i.uuid
-       WHERE i.role = 'vta' AND i.uuid <> $1
-         AND d.did IN (SELECT dd.did FROM did_documents dd WHERE dd.identity_uuid = $1)
+       WHERE i.role = 'vta' AND i.uuid <> ?
+         AND d.did IN (SELECT dd.did FROM did_documents dd WHERE dd.identity_uuid = ?)
          AND EXISTS (SELECT 1 FROM peer_endpoints pe WHERE pe.identity_uuid = i.uuid)
        ORDER BY i.created_at, i.uuid
        LIMIT 1`,
-      stubUuid,
+      // Positional `?` with one bound value per placeholder: node:sqlite does not
+      // bind a positional argument to a `$1` parameter ("column index out of range").
+      stubUuid, stubUuid,
     );
     if (realByDid) {
       console.log(`[ceremony-participant] resolveRealVtaForStub → real (by DID) = ${realByDid.uuid}`);
@@ -813,10 +815,10 @@ export class CeremonyCoordinatorParticipant implements Participant {
        JOIN keys k2 ON k2.public_key = k.public_key AND k2.key_type = k.key_type
        JOIN identities i2 ON i2.uuid = k2.identity_uuid
        JOIN peer_endpoints pe ON pe.identity_uuid = i.uuid
-       WHERE i2.uuid = $1 AND i.role = 'vta' AND i.uuid <> $1
+       WHERE i2.uuid = ? AND i.role = 'vta' AND i.uuid <> ?
        ORDER BY i.created_at, i.uuid
        LIMIT 1`,
-      stubUuid,
+      stubUuid, stubUuid,
     );
     if (real) {
       console.log(`[ceremony-participant] resolveRealVtaForStub → real (by key) = ${real.uuid}`);
