@@ -23,6 +23,12 @@ interface AppendRotationBody {
   previousHash?: string; // base64
   newPublicKey: string; // base64
   signedEntry: string; // base64
+  /**
+   * Unix seconds the entry was signed at. The entry digest covers it, so it
+   * must be stored verbatim or the entry no longer validates on resolution.
+   * Defaults to the insertion time for clients whose entries do not depend on it.
+   */
+  createdAt?: number;
 }
 
 interface AddAttestationBody {
@@ -44,13 +50,22 @@ export function registerRotationRoutes(app: FastifyInstance, db: DataSource): vo
         return reply.code(404).send({ error: { message: `did_document ${didDocumentUuid} not found` } });
       }
 
-      const rowUuid = await rotationRepo.appendEntry(db, {
+      if (body.createdAt !== undefined && !(Number.isSafeInteger(body.createdAt) && body.createdAt >= 0)) {
+        return reply.code(400).send({ error: { message: 'createdAt must be a non-negative integer (unix seconds)' } });
+      }
+
+      const inserted = await rotationRepo.insertIfAbsent(db, {
         didDocumentUuid: doc.uuid,
         version: body.version,
         previousHash: body.previousHash ? Buffer.from(body.previousHash, 'base64') : undefined,
         newPublicKey: Buffer.from(body.newPublicKey, 'base64'),
         signedEntry: Buffer.from(body.signedEntry, 'base64'),
+        createdAt: body.createdAt,
       });
+      if (!inserted) {
+        return reply.code(409).send({ error: { message: `rotation log version ${body.version} already exists for did_document ${didDocumentUuid}` } });
+      }
+      const rowUuid = (await rotationRepo.findForDidDocument(db, doc.uuid)).find((r) => r.version === body.version)!.uuid;
 
       return reply.code(201).send({ uuid: rowUuid });
     },
